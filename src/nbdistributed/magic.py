@@ -161,21 +161,16 @@ class DistributedMagic(Magics):
 
     @line_magic
     @magic_arguments()
-    @argument(
-        "--force",
-        "-f",
-        action="store_true",
-        help="Force shutdown even if communication fails",
-    )
     def dist_shutdown(self, line):
-        """Shutdown distributed workers"""
-        args = parse_argstring(self.dist_shutdown, line)
-
-        if args.force:
-            print("Force shutting down distributed workers...")
-            self.force_shutdown_all()
-        else:
-            self.shutdown_all()
+        """Shutdown distributed workers using nuclear option"""
+        print("Shutting down distributed workers (nuclear option)...")
+        self.force_shutdown_all()
+        
+        # CRITICAL: Also clear instance variables since dist_init creates them
+        self._process_manager = None
+        self._comm_manager = None
+        self._num_processes = 0
+        
         print("Distributed workers shutdown")
 
     @classmethod
@@ -210,45 +205,77 @@ class DistributedMagic(Magics):
 
     @classmethod
     def _nuclear_shutdown(cls):
-        """Nuclear option: kill processes using system commands"""
-        if not cls._process_manager:
-            return
-
+        """Nuclear option: kill ALL processes related to distributed workers"""
         import os
         import signal
+        import subprocess
+        import time
 
-        print("Nuclear shutdown: killing processes directly...")
-        for i, process in enumerate(cls._process_manager.processes):
-            try:
-                pid = process.pid
-                print(f"Killing worker {i} with PID {pid}")
+        print("🚀 NUCLEAR SHUTDOWN: Terminating ALL related processes...")
+        
+        # First, kill processes by pattern (any process with worker.py or similar)
+        try:
+            print("Killing processes by pattern...")
+            subprocess.run(["pkill", "-f", "worker.py"], timeout=5)
+            subprocess.run(["pkill", "-f", "nbdistributed"], timeout=5) 
+            subprocess.run(["pkill", "-f", "distributed.*worker"], timeout=5)
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            print(f"Pattern kill failed (continuing): {e}")
 
-                # Try SIGTERM first
-                os.kill(pid, signal.SIGTERM)
-
-                # Wait a bit then check if it's dead
-                import time
-
-                time.sleep(1)
-
-                # If still alive, use SIGKILL
+        # Kill tracked processes and their process groups
+        if cls._process_manager and cls._process_manager.processes:
+            for i, process in enumerate(cls._process_manager.processes):
                 try:
-                    os.kill(pid, 0)  # Check if process exists
-                    print(f"Worker {i} still alive, using SIGKILL")
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    print(f"Worker {i} successfully terminated")
+                    pid = process.pid
+                    print(f"Nuking worker {i} (PID {pid}) and process group...")
+                    
+                    # Kill the entire process group first
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        print(f"Process group for worker {i} killed")
+                    except (ProcessLookupError, OSError):
+                        pass
+                    
+                    # Then kill the specific process
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        print(f"Worker {i} process killed")
+                    except ProcessLookupError:
+                        print(f"Worker {i} already dead")
+                        
+                except Exception as e:
+                    print(f"Failed to kill worker {i}: {e}")
 
-            except ProcessLookupError:
-                print(f"Worker {i} already dead")
-            except Exception as e:
-                print(f"Failed to kill worker {i}: {e}")
+            # CRITICAL: Force all subprocess objects to update their status
+            print("Forcing subprocess objects to recognize process death...")
+            for i, process in enumerate(cls._process_manager.processes):
+                try:
+                    # Force the subprocess to check if it's dead
+                    process.poll()
+                    # Try to wait with timeout to clean up zombie
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    print(f"Subprocess {i} status updated")
+                except Exception as e:
+                    print(f"Error updating subprocess {i}: {e}")
 
-        # Clear the process list
-        cls._process_manager.processes.clear()
-        cls._process_manager.num_ranks = 0
-        cls._process_manager.gpu_assignments.clear()
-        print("Nuclear shutdown completed")
+        # Kill any remaining processes that might be hanging around
+        try:
+            print("Final cleanup: killing any remaining distributed processes...")
+            subprocess.run(["pkill", "-9", "-f", "python.*worker"], timeout=5)
+            subprocess.run(["pkill", "-9", "-f", "torch.*distributed"], timeout=5)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+        # Clear all state
+        if cls._process_manager:
+            cls._process_manager.processes.clear()
+            cls._process_manager.num_processes = 0
+            cls._process_manager.gpu_assignments.clear()
+            
+        print("💥 NUCLEAR SHUTDOWN COMPLETED - All processes terminated")
 
     @line_magic
     @magic_arguments()
