@@ -1,5 +1,16 @@
 """
-Worker process for distributed execution
+Worker process implementation for distributed execution in Jupyter notebooks.
+
+This module implements the worker process that runs on each GPU/CPU for distributed
+execution. Each worker:
+- Initializes PyTorch distributed environment
+- Sets up ZMQ communication with the coordinator
+- Maintains its own Python namespace
+- Executes code sent from the notebook
+- Handles REPL-like behavior for interactive output
+
+The workers are managed by the ProcessManager and communicate through the
+CommunicationManager using ZMQ sockets.
 """
 
 import os
@@ -15,6 +26,27 @@ from nbdistributed.communication import Message
 
 
 class DistributedWorker:
+    """
+    Worker process for distributed execution of PyTorch code.
+    
+    This class represents a single worker in the distributed environment. Each worker:
+    - Runs on a specific GPU (if available)
+    - Participates in PyTorch distributed training
+    - Maintains its own Python namespace
+    - Executes code sent from the Jupyter notebook
+    - Captures and returns output in a REPL-like manner
+    
+    Attributes:
+        rank (int): Global rank of this worker
+        world_size (int): Total number of workers
+        master_addr (str): Address of the master node
+        master_port (str): Port for PyTorch distributed
+        gpu_id (Optional[int]): Specific GPU ID assigned to this worker
+        namespace (dict): Local Python namespace for code execution
+        context (zmq.Context): ZMQ context for communication
+        socket (zmq.Socket): ZMQ socket for coordinator communication
+    """
+
     def __init__(
         self,
         rank: int,
@@ -24,6 +56,24 @@ class DistributedWorker:
         comm_port: int,
         gpu_id: Optional[int] = None,
     ):
+        """
+        Initialize a distributed worker process.
+        
+        Args:
+            rank (int): Global rank of this worker
+            world_size (int): Total number of workers
+            master_addr (str): Address of the master node
+            master_port (str): Port for PyTorch distributed
+            comm_port (int): Port for ZMQ communication
+            gpu_id (Optional[int]): Specific GPU ID to use, if any
+            
+        The initialization process:
+        1. Sets up PyTorch distributed environment variables
+        2. Initializes the distributed process group
+        3. Sets up ZMQ communication with coordinator
+        4. Initializes the local namespace with common variables
+        5. Configures GPU if available
+        """
         self.rank = rank
         self.world_size = world_size
         self.master_addr = master_addr
@@ -85,7 +135,24 @@ class DistributedWorker:
         print(f"Worker {rank} initialized")
 
     def run(self):
-        """Main worker loop"""
+        """
+        Main worker loop for processing commands.
+        
+        This method:
+        1. Receives messages from the coordinator
+        2. Processes different message types:
+           - shutdown: Clean shutdown of the worker
+           - execute: Execute Python code
+           - get_var: Retrieve a variable from namespace
+           - set_var: Set a variable in namespace
+           - sync: Synchronize with other workers
+           - get_status: Get worker status
+           - get_namespace_info: Get namespace information
+        3. Sends results back to coordinator
+        4. Handles errors and exceptions
+        
+        The loop continues until a shutdown message is received.
+        """
         while True:
             try:
                 message_data = self.socket.recv()
@@ -135,7 +202,39 @@ class DistributedWorker:
                 self.socket.send(response)
 
     def _execute_code(self, code: str) -> Dict[str, Any]:
-        """Execute code in worker namespace with REPL-like behavior"""
+        """
+        Execute Python code in the worker's namespace with REPL-like behavior.
+        
+        This method provides Jupyter-like execution where:
+        1. The last expression's value is captured and returned
+        2. Print statements and other output are captured
+        3. The namespace is preserved between executions
+        4. Errors are caught and formatted appropriately
+        
+        The execution strategy:
+        1. First tries to parse code as a single expression
+        2. If that fails, parses as statements with possible final expression
+        3. Captures both stdout and expression values
+        4. Returns formatted output similar to Jupyter
+        
+        Args:
+            code (str): Python code to execute
+            
+        Returns:
+            Dict[str, Any]: Execution result containing:
+                - output: Captured stdout and expression result
+                - status: Execution status
+                - rank: Worker rank
+                - error: Error message if execution failed
+                - traceback: Stack trace if execution failed
+        
+        Example:
+            >>> worker._execute_code("print('hello')")
+            {'output': 'hello\\n', 'status': 'success', 'rank': 0}
+            
+            >>> worker._execute_code("2 + 2")
+            {'output': '4', 'status': 'success', 'rank': 0}
+        """
         try:
             # Capture stdout
             from io import StringIO
@@ -229,7 +328,24 @@ class DistributedWorker:
             }
 
     def _get_variable(self, var_name: str) -> Dict[str, Any]:
-        """Get variable from namespace"""
+        """
+        Retrieve a variable from the worker's namespace.
+        
+        This method handles special cases for different types:
+        - PyTorch tensors: Returns device, dtype, and shape info
+        - Regular Python objects: Returns pickled value
+        
+        Args:
+            var_name (str): Name of variable to retrieve
+            
+        Returns:
+            Dict[str, Any]: Variable information containing:
+                - value: The variable value
+                - device: Device info for tensors
+                - dtype: Data type for tensors
+                - shape: Shape for tensors
+                - error: Error message if retrieval failed
+        """
         try:
             if var_name in self.namespace:
                 value = self.namespace[var_name]
@@ -310,15 +426,50 @@ class DistributedWorker:
             return {"error": str(e), "traceback": traceback.format_exc()}
 
     def _set_variable(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Set variable in namespace"""
+        """
+        Set a variable in the worker's namespace.
+        
+        Args:
+            data (Dict[str, Any]): Dictionary containing:
+                - name: Variable name
+                - value: Variable value
+                
+        Returns:
+            Dict[str, Any]: Result of operation:
+                - status: Success/failure
+                - error: Error message if failed
+        """
         try:
-            self.namespace[data["name"]] = data["value"]
+            name = data["name"]
+            value = data["value"]
+            self.namespace[name] = value
             return {"status": "success"}
         except Exception as e:
             return {"error": str(e)}
 
     def _get_status(self) -> Dict[str, Any]:
-        """Get detailed status information including GPU details"""
+        """
+        Get detailed status information about this worker.
+        
+        Returns information about:
+        - Process status
+        - GPU assignment and utilization
+        - Memory usage
+        - CUDA availability
+        - Current device
+        
+        Returns:
+            Dict[str, Any]: Status information containing:
+                - pid: Process ID
+                - running: Whether process is running
+                - gpu_id: Assigned GPU ID
+                - gpu_name: GPU device name
+                - gpu_memory_allocated: Allocated GPU memory
+                - gpu_memory_reserved: Reserved GPU memory
+                - gpu_memory_total: Total GPU memory
+                - cuda_available: Whether CUDA is available
+                - current_device: Current device (CPU/GPU)
+        """
         status = {
             "rank": self.rank,
             "world_size": self.world_size,
@@ -357,7 +508,14 @@ class DistributedWorker:
         return status
 
     def shutdown(self):
-        """Cleanup worker"""
+        """
+        Clean shutdown of the worker process.
+        
+        This method:
+        1. Closes ZMQ socket and context
+        2. Cleans up PyTorch distributed
+        3. Releases GPU resources
+        """
         dist.destroy_process_group()
         self.socket.close()
         self.context.term()

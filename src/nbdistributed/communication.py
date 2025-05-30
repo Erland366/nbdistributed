@@ -1,5 +1,20 @@
 """
-Communication layer for distributed processes
+Communication layer for distributed process coordination in Jupyter notebooks.
+
+This module implements the communication infrastructure between the coordinator
+(Jupyter kernel) and worker processes. It uses ZMQ (ZeroMQ) for efficient
+message passing with features including:
+- Asynchronous message handling
+- Request-response pattern
+- Timeout handling
+- Message queuing
+- Worker targeting (all/specific ranks)
+
+The communication is built on ZMQ's ROUTER-DEALER pattern, which enables:
+- Bidirectional communication
+- Message routing by worker rank
+- Non-blocking operations
+- Reliable message delivery
 """
 
 import zmq
@@ -13,6 +28,32 @@ import uuid
 
 @dataclass
 class Message:
+    """
+    Message container for inter-process communication.
+    
+    This class represents a message in the distributed system. It contains:
+    - Unique message identifier
+    - Message type (e.g., execute, shutdown)
+    - Source/destination rank
+    - Payload data
+    - Timestamp for tracking
+    
+    Attributes:
+        msg_id (str): Unique message identifier (UUID)
+        msg_type (str): Type of message (e.g., "execute", "shutdown")
+        rank (int): Source/destination rank (-1 for coordinator)
+        data (Any): Message payload
+        timestamp (float): Unix timestamp of message creation
+        
+    Example:
+        >>> msg = Message(
+        ...     msg_id=str(uuid.uuid4()),
+        ...     msg_type="execute",
+        ...     rank=0,
+        ...     data="print('hello')",
+        ...     timestamp=time.time()
+        ... )
+    """
     msg_id: str
     msg_type: str
     rank: int
@@ -21,7 +62,49 @@ class Message:
 
 
 class CommunicationManager:
+    """
+    Manager for coordinating communication between processes.
+    
+    This class handles all communication between the Jupyter kernel (coordinator)
+    and worker processes. It provides:
+    - Message routing to specific workers
+    - Asynchronous message handling
+    - Response collection and timeout management
+    - Clean shutdown handling
+    
+    The manager uses ZMQ's ROUTER-DEALER pattern where:
+    - The coordinator (ROUTER) can send messages to specific workers
+    - Workers (DEALERS) are identified by their rank
+    - Messages are handled asynchronously in a background thread
+    
+    Attributes:
+        num_processes (int): Total number of worker processes
+        base_port (int): Base port for ZMQ communication
+        context (zmq.Context): ZMQ context
+        coordinator_socket (zmq.Socket): ROUTER socket for coordinator
+        message_queue (dict): Queue of pending messages
+        response_events (dict): Events for tracking responses
+        running (bool): Control flag for message handler thread
+        handler_thread (threading.Thread): Background message processing thread
+    """
+
     def __init__(self, num_processes: int, base_port: int = 5555):
+        """
+        Initialize the communication manager.
+        
+        Args:
+            num_processes (int): Number of worker processes to coordinate
+            base_port (int): Base port for ZMQ communication
+            
+        The initialization:
+        1. Creates ZMQ context and sockets
+        2. Sets up message queuing
+        3. Starts background message handler
+        
+        Note:
+            The base_port must be available for binding the ROUTER socket.
+            Workers will connect to this port automatically.
+        """
         self.num_processes = num_processes
         self.base_port = base_port
         self.context = zmq.Context()
@@ -41,7 +124,23 @@ class CommunicationManager:
         self.handler_thread.start()
 
     def _message_handler(self):
-        """Handle incoming messages from workers"""
+        """
+        Background thread for processing incoming messages.
+        
+        This method runs in a separate thread and:
+        1. Polls for incoming messages
+        2. Deserializes received messages
+        3. Queues messages by ID
+        4. Signals when all responses are received
+        
+        The handler uses a 100ms timeout when polling to allow for:
+        - Regular checking of the running flag
+        - Prevention of busy-waiting
+        - Quick shutdown when requested
+        
+        Exceptions in message handling are caught and logged to prevent
+        the thread from crashing.
+        """
         while self.running:
             try:
                 if self.coordinator_socket.poll(100):  # 100ms timeout
@@ -68,7 +167,31 @@ class CommunicationManager:
     def send_to_all(
         self, msg_type: str, data: Any, timeout: float = 30.0
     ) -> Dict[int, Any]:
-        """Send message to all workers and wait for responses"""
+        """
+        Send a message to all workers and collect responses.
+        
+        This method:
+        1. Creates a unique message ID
+        2. Sends the message to all workers
+        3. Waits for responses from all workers
+        4. Returns collected responses
+        
+        Args:
+            msg_type (str): Type of message to send
+            data (Any): Data payload for the message
+            timeout (float): Maximum time to wait for responses
+            
+        Returns:
+            Dict[int, Any]: Responses from workers, keyed by rank
+            
+        Raises:
+            TimeoutError: If not all workers respond within timeout
+            
+        Example:
+            >>> responses = manager.send_to_all("execute", "print(rank)")
+            >>> print(responses)
+            {0: {'output': '0\\n'}, 1: {'output': '1\\n'}}
+        """
         msg_id = str(uuid.uuid4())
         message = Message(
             msg_id=msg_id,
@@ -99,14 +222,61 @@ class CommunicationManager:
     def send_to_rank(
         self, rank: int, msg_type: str, data: Any, timeout: float = 30.0
     ) -> Any:
-        """Send message to specific rank"""
+        """
+        Send a message to a specific worker rank.
+        
+        This is a convenience wrapper around send_to_ranks() for
+        single-rank communication.
+        
+        Args:
+            rank (int): Worker rank to send to
+            msg_type (str): Type of message to send
+            data (Any): Data payload for the message
+            timeout (float): Maximum time to wait for response
+            
+        Returns:
+            Any: Response data from the worker
+            
+        Raises:
+            TimeoutError: If worker doesn't respond within timeout
+            
+        Example:
+            >>> response = manager.send_to_rank(0, "execute", "print('hello')")
+            >>> print(response)
+            {'output': 'hello\\n'}
+        """
         responses = self.send_to_ranks([rank], msg_type, data, timeout)
         return responses[rank]
 
     def send_to_ranks(
         self, ranks: List[int], msg_type: str, data: Any, timeout: float = 30.0
     ) -> Dict[int, Any]:
-        """Send message to specific ranks"""
+        """
+        Send a message to specific worker ranks.
+        
+        This method:
+        1. Creates a unique message ID
+        2. Sends the message to specified ranks
+        3. Waits for responses from those ranks
+        4. Returns collected responses
+        
+        Args:
+            ranks (List[int]): List of worker ranks to send to
+            msg_type (str): Type of message to send
+            data (Any): Data payload for the message
+            timeout (float): Maximum time to wait for responses
+            
+        Returns:
+            Dict[int, Any]: Responses from workers, keyed by rank
+            
+        Raises:
+            TimeoutError: If any worker doesn't respond within timeout
+            
+        Example:
+            >>> responses = manager.send_to_ranks([0,2], "execute", "print(rank)")
+            >>> print(responses)
+            {0: {'output': '0\\n'}, 2: {'output': '2\\n'}}
+        """
         msg_id = str(uuid.uuid4())
         message = Message(
             msg_id=msg_id, msg_type=msg_type, rank=-1, data=data, timestamp=time.time()
@@ -134,7 +304,19 @@ class CommunicationManager:
         raise TimeoutError(f"Timeout waiting for responses from ranks {ranks}")
 
     def shutdown(self):
-        """Shutdown communication"""
+        """
+        Clean shutdown of the communication manager.
+        
+        This method:
+        1. Stops the message handler thread
+        2. Closes the ZMQ socket
+        3. Terminates the ZMQ context
+        
+        This should be called when:
+        - The notebook kernel is shutting down
+        - The distributed system is being reset
+        - Error recovery requires communication restart
+        """
         self.running = False
         self.handler_thread.join()
         self.coordinator_socket.close()

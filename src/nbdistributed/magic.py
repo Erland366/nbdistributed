@@ -1,6 +1,17 @@
 # jupyter_distributed/magic.py
 """
-IPython magic commands for distributed execution
+IPython magic commands for distributed execution in Jupyter notebooks.
+
+This module provides IPython magic commands for distributed execution of Python code
+across multiple processes, particularly useful for distributed PyTorch training.
+It enables seamless execution of code across multiple GPUs from within Jupyter notebooks.
+
+Key Features:
+- Automatic distribution of code execution across multiple processes
+- GPU-aware process management
+- Transparent communication between processes
+- REPL-like output capturing
+- Automatic namespace synchronization for IDE support
 """
 
 from IPython.core.magic import Magics, magics_class, line_magic, cell_magic
@@ -13,6 +24,29 @@ from nbdistributed.communication import CommunicationManager
 
 @magics_class
 class DistributedMagic(Magics):
+    """
+    IPython magic commands for distributed execution across multiple processes.
+    
+    This class provides magic commands that enable distributed execution of Python code
+    across multiple processes, with special support for PyTorch distributed training.
+    It manages process creation, inter-process communication, and automatic code distribution.
+    
+    Key Magic Commands:
+        %dist_init: Initialize distributed workers
+        %%distributed: Execute code on all ranks
+        %%rank [n]: Execute code on specific ranks
+        %sync: Synchronize all ranks
+        %dist_status: Show worker status
+        %dist_shutdown: Shutdown workers
+        %dist_mode: Toggle automatic distributed mode
+        
+    Class Attributes:
+        _process_manager (Optional[ProcessManager]): Manages distributed worker processes
+        _comm_manager (Optional[CommunicationManager]): Handles inter-process communication
+        _num_processes (int): Number of active distributed processes
+        _distributed_mode_active (bool): Whether automatic distributed execution is enabled
+    """
+    
     _process_manager: Optional[ProcessManager] = None
     _comm_manager: Optional[CommunicationManager] = None
     _num_processes: int = 0
@@ -34,7 +68,30 @@ class DistributedMagic(Magics):
         help="Comma-separated list of GPU IDs to use (e.g., '0,1,3'). If not specified, cycles through all available GPUs.",
     )
     def dist_init(self, line):
-        """Initialize distributed workers"""
+        """
+        Initialize distributed workers for parallel execution.
+        
+        This magic command starts the distributed execution environment by:
+        1. Creating worker processes
+        2. Assigning GPUs to workers
+        3. Setting up communication channels
+        4. Enabling automatic distributed execution
+        
+        Args:
+            line (str): Command line arguments:
+                --num-processes/-n: Number of worker processes (default: 2)
+                --master-addr/-a: Master node address (default: localhost)
+                --gpu-ids/-g: Specific GPU IDs to use (e.g., "0,1,3")
+                
+        Example:
+            >>> %dist_init -n 4 -g "0,1,2,3"
+            Starting 4 distributed workers...
+            ✓ Successfully started 4 workers
+            Rank 0 -> GPU 0
+            Rank 1 -> GPU 1
+            Rank 2 -> GPU 2
+            Rank 3 -> GPU 3
+        """
         args = parse_argstring(self.dist_init, line)
 
         if self._process_manager and self._process_manager.is_running():
@@ -126,7 +183,17 @@ class DistributedMagic(Magics):
             self.shutdown_all()
 
     def _enable_distributed_mode(self):
-        """Enable automatic distributed execution using input transformer"""
+        """
+        Enable automatic distributed execution using input transformer.
+        
+        When enabled, all regular notebook cells are automatically executed across
+        all worker processes. Magic commands still execute locally.
+        
+        The function:
+        1. Adds an input transformer to prepend %%distributed to regular cells
+        2. Registers a post-execution handler for namespace syncing
+        3. Updates the distributed mode state
+        """
         if not self._distributed_mode_active:
             self.shell.input_transformers_cleanup.append(self._distributed_transformer)
             
@@ -137,7 +204,14 @@ class DistributedMagic(Magics):
             self._distributed_mode_active = True
 
     def _disable_distributed_mode(self):
-        """Disable automatic distributed execution"""
+        """
+        Disable automatic distributed execution.
+        
+        Reverts the notebook to normal local execution by:
+        1. Removing the distributed input transformer
+        2. Unregistering the post-execution sync handler
+        3. Updating the distributed mode state
+        """
         if self._distributed_mode_active:
             try:
                 self.shell.input_transformers_cleanup.remove(self._distributed_transformer)
@@ -154,7 +228,17 @@ class DistributedMagic(Magics):
             self._distributed_mode_active = False
 
     def _post_execution_sync(self, result):
-        """Post-execution handler to sync namespaces for IDE support"""
+        """
+        Post-execution handler to sync namespaces for IDE support.
+        
+        After a cell executes in distributed mode, this handler:
+        1. Checks if the cell was transformed for distributed execution
+        2. If so, syncs the namespace from workers to the local kernel
+        3. Enables IDE features like autocomplete for distributed variables
+        
+        Args:
+            result: IPython execution result object
+        """
         try:
             # Only sync if the cell was transformed (i.e., it was a regular cell in distributed mode)
             if (hasattr(result, 'info') and 
@@ -166,7 +250,20 @@ class DistributedMagic(Magics):
             pass  # Silently ignore sync errors
 
     def _distributed_transformer(self, lines):
-        """Transform non-magic cells to use %%distributed automatically"""
+        """
+        Transform non-magic cells to use %%distributed automatically.
+        
+        This transformer:
+        1. Checks if the cell should be distributed
+        2. Prepends %%distributed to eligible cells
+        3. Preserves magic commands and comments as local execution
+        
+        Args:
+            lines (List[str]): Lines of code from the notebook cell
+            
+        Returns:
+            List[str]: Transformed lines with %%distributed prepended if appropriate
+        """
         if not lines:
             return lines
             
@@ -188,7 +285,24 @@ class DistributedMagic(Magics):
 
     @line_magic
     def dist_status(self, line):
-        """Show status of distributed workers"""
+        """
+        Show detailed status of distributed workers.
+        
+        Displays information about each worker process including:
+        - Process status (running/stopped)
+        - GPU assignment and name
+        - Memory usage (if available)
+        - Process ID and exit code (if stopped)
+        
+        Example:
+            >>> %dist_status
+            Distributed cluster status (4 processes):
+            ============================================================
+            Rank 0: ✓ PID 12345
+              ├─ GPU: 0 (NVIDIA A100)
+              ├─ Memory: 10.5GB / 40.0GB (26.2% used)
+              └─ Status: Running
+        """
         if not self._process_manager:
             print("No distributed workers running")
             return
@@ -239,7 +353,18 @@ class DistributedMagic(Magics):
     @line_magic
     @magic_arguments()
     def dist_shutdown(self, line):
-        """Shutdown distributed workers using nuclear option"""
+        """
+        Shutdown distributed workers using nuclear option.
+        
+        This command:
+        1. Forces termination of all worker processes
+        2. Cleans up communication channels
+        3. Disables distributed mode
+        4. Resets all internal state
+        
+        This is a "nuclear" option that ensures all processes are terminated,
+        even if they're not responding to normal shutdown signals.
+        """
         print("Shutting down distributed workers (nuclear option)...")
         self.force_shutdown_all()
         
@@ -256,7 +381,16 @@ class DistributedMagic(Magics):
 
     @classmethod
     def force_shutdown_all(cls):
-        """Force shutdown all distributed components without waiting for responses"""
+        """
+        Force shutdown all distributed components without waiting for responses.
+        
+        This class method:
+        1. Attempts graceful shutdown of communication
+        2. Forces process termination if graceful shutdown fails
+        3. Cleans up all class-level state
+        
+        This is used as a last resort when normal shutdown fails.
+        """
         print("Starting force shutdown...")
 
         # First try graceful shutdown of communication
@@ -286,7 +420,18 @@ class DistributedMagic(Magics):
 
     @classmethod
     def _nuclear_shutdown(cls):
-        """Nuclear option: kill ALL processes related to distributed workers"""
+        """
+        Nuclear option: kill ALL processes related to distributed workers.
+        
+        This method uses aggressive process termination:
+        1. Kills processes by pattern matching
+        2. Kills process groups
+        3. Forces subprocess status updates
+        4. Performs final cleanup of any remaining processes
+        
+        This ensures no distributed processes remain running, even
+        if they're not properly tracked or responding.
+        """
         import os
         import signal
         import subprocess
@@ -367,7 +512,19 @@ class DistributedMagic(Magics):
         help="Nuclear shutdown: kill all processes directly",
     )
     def dist_reset(self, line):
-        """Complete reset of distributed environment using direct process termination"""
+        """
+        Complete reset of distributed environment.
+        
+        This command:
+        1. Performs nuclear shutdown of all processes
+        2. Disables distributed mode
+        3. Clears all internal state
+        4. Prepares the environment for a fresh start
+        
+        Args:
+            line (str): Command line arguments:
+                --nuclear/-n: Use nuclear shutdown option
+        """
         print("=== DISTRIBUTED ENVIRONMENT RESET ===")
 
         # Always use nuclear shutdown since it's the most reliable
@@ -390,7 +547,17 @@ class DistributedMagic(Magics):
 
     @classmethod
     def shutdown_all(cls):
-        """Shutdown all distributed components"""
+        """
+        Shutdown all distributed components with graceful cleanup.
+        
+        This class method:
+        1. Sends shutdown signal to workers
+        2. Closes communication channels
+        3. Terminates worker processes
+        4. Cleans up class-level state
+        
+        This is the preferred shutdown method when processes are responsive.
+        """
         if cls._comm_manager:
             try:
                 cls._comm_manager.send_to_all("shutdown", {}, timeout=5.0)
@@ -417,7 +584,23 @@ class DistributedMagic(Magics):
 
     @cell_magic
     def distributed(self, line, cell):
-        """Execute code on all ranks"""
+        """
+        Execute code on all ranks in the distributed environment.
+        
+        This magic:
+        1. Sends the code to all worker processes
+        2. Collects and displays results from each rank
+        3. Syncs the namespace back to the local kernel
+        
+        Args:
+            line (str): Line magic arguments (unused)
+            cell (str): Code to execute on all ranks
+            
+        Example:
+            >>> %%distributed
+            >>> import torch
+            >>> print(f"Rank {rank}: {torch.cuda.get_device_name()}")
+        """
         if not self._comm_manager:
             print("No distributed workers running. Use %dist_init first.")
             return
@@ -433,7 +616,17 @@ class DistributedMagic(Magics):
             print(f"Error executing distributed code: {e}")
 
     def _sync_namespace_to_local(self):
-        """Sync variable type information from workers to local IPython kernel for IDE integration"""
+        """
+        Sync variable type information from workers to local IPython kernel.
+        
+        This method:
+        1. Gets namespace information from rank 0
+        2. Creates local proxy objects for IDE support
+        3. Enables features like autocomplete for distributed variables
+        
+        The sync focuses on type information to support IDE features
+        without copying large data objects.
+        """
         try:
             # Get namespace info from rank 0 (representative)
             response = self._comm_manager.send_to_ranks([0], "get_namespace_info", "")
@@ -447,7 +640,18 @@ class DistributedMagic(Magics):
             print(f"Warning: Could not sync namespace for IDE support: {e}")
 
     def _create_local_proxies(self, namespace_info: Dict[str, Any]):
-        """Create proxy objects in local IPython namespace for IDE integration"""
+        """
+        Create proxy objects in local IPython namespace for IDE integration.
+        
+        This method creates appropriate proxy objects based on type:
+        - PyTorch tensors: Creates zero tensors with matching shape/dtype
+        - Modules: Imports or creates placeholder modules
+        - Functions: Creates stub functions with matching signatures
+        - Basic types: Creates matching Python objects
+        
+        Args:
+            namespace_info (Dict[str, Any]): Type information for variables
+        """
         try:
             import torch
             from types import ModuleType
@@ -574,7 +778,22 @@ def {var_name}{signature}:
 
     @cell_magic
     def rank(self, line, cell):
-        """Execute code on specific ranks"""
+        """
+        Execute code on specific ranks in the distributed environment.
+        
+        This magic allows targeting specific worker processes:
+        1. Parses rank specification (e.g., [0,1] or [0-2])
+        2. Sends code only to specified ranks
+        3. Displays results from those ranks
+        
+        Args:
+            line (str): Rank specification (e.g., "[0,1,2]" or "[0-2]")
+            cell (str): Code to execute on specified ranks
+            
+        Example:
+            >>> %%rank[0,1]
+            >>> print(f"Running on rank {rank}")
+        """
         if not self._comm_manager:
             print("No distributed workers running. Use %dist_init first.")
             return
@@ -593,7 +812,16 @@ def {var_name}{signature}:
 
     @line_magic
     def sync(self, line):
-        """Synchronize all ranks"""
+        """
+        Synchronize all ranks in the distributed environment.
+        
+        This magic:
+        1. Sends a sync signal to all workers
+        2. Waits for acknowledgment from each rank
+        3. Ensures all ranks are at the same execution point
+        
+        This is useful when coordination between ranks is needed.
+        """
         if not self._comm_manager:
             print("No distributed workers running. Use %dist_init first.")
             return
@@ -606,7 +834,18 @@ def {var_name}{signature}:
 
     @line_magic
     def dist_debug(self, line):
-        """Debug information about the distributed state"""
+        """
+        Display debug information about the distributed state.
+        
+        Shows detailed information about:
+        - Process manager status
+        - Communication manager status
+        - Number of processes
+        - Distributed mode state
+        - Individual process status and PIDs
+        
+        This is useful for diagnosing issues with the distributed setup.
+        """
         print("=== Distributed Debug Information ===")
         print(f"Process manager exists: {self._process_manager is not None}")
         print(f"Communication manager exists: {self._comm_manager is not None}")
@@ -639,7 +878,22 @@ def {var_name}{signature}:
         "--disable", "-d", action="store_true", help="Disable distributed mode"
     )
     def dist_mode(self, line):
-        """Toggle distributed mode on/off without affecting workers"""
+        """
+        Toggle distributed mode on/off without affecting workers.
+        
+        This magic controls automatic distributed execution:
+        - When enabled: Regular cells execute on all workers
+        - When disabled: Regular cells execute locally
+        
+        Args:
+            line (str): Command line arguments:
+                --enable/-e: Enable distributed mode
+                --disable/-d: Disable distributed mode
+                
+        Example:
+            >>> %dist_mode --enable  # Enable distributed mode
+            >>> %dist_mode --disable  # Disable distributed mode
+        """
         args = parse_argstring(self.dist_mode, line)
         
         if not self._comm_manager:
@@ -669,7 +923,23 @@ def {var_name}{signature}:
             print("Use %dist_mode --enable or %dist_mode --disable to toggle")
 
     def _parse_ranks(self, line: str) -> List[int]:
-        """Parse rank specification like [0,1,2] or [0-2]"""
+        """
+        Parse rank specification from string format.
+        
+        Supports two formats:
+        1. Comma-separated list: [0,1,2]
+        2. Range specification: [0-2]
+        
+        Args:
+            line (str): Rank specification string
+            
+        Returns:
+            List[int]: List of valid rank numbers
+            
+        Example:
+            >>> _parse_ranks("[0,1,2]")  # Returns [0,1,2]
+            >>> _parse_ranks("[0-2]")    # Returns [0,1,2]
+        """
         line = line.strip()
         if not line.startswith("[") or not line.endswith("]"):
             return []
@@ -691,7 +961,27 @@ def {var_name}{signature}:
         return [r for r in ranks if 0 <= r < self._num_processes]
 
     def _display_responses(self, responses: Dict[int, Any], title: str):
-        """Display responses from workers with enhanced REPL-like formatting"""
+        """
+        Display responses from workers with enhanced REPL-like formatting.
+        
+        This method:
+        1. Formats responses from each rank
+        2. Displays output and errors appropriately
+        3. Provides visual separation between ranks
+        
+        Args:
+            responses (Dict[int, Any]): Responses from workers
+            title (str): Title for the response block
+            
+        Example output:
+            === All ranks ===
+            
+            --- Rank 0 ---
+            Hello from rank 0
+            
+            --- Rank 1 ---
+            Hello from rank 1
+        """
         print(f"\n=== {title} ===")
 
         for rank in sorted(responses.keys()):
@@ -711,7 +1001,16 @@ def {var_name}{signature}:
 
     @line_magic
     def dist_sync_ide(self, line):
-        """Manually sync worker namespaces to local kernel for IDE support"""
+        """
+        Manually sync worker namespaces to local kernel for IDE support.
+        
+        This magic:
+        1. Retrieves namespace information from workers
+        2. Creates local proxy objects
+        3. Enables IDE features like autocomplete
+        
+        This is useful when automatic sync fails or manual refresh is needed.
+        """
         if not self._comm_manager:
             print("No distributed workers running. Use %dist_init first.")
             return

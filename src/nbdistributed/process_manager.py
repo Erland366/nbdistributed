@@ -1,6 +1,16 @@
 # jupyter_distributed/process_manager.py
 """
-Process management for distributed workers
+Process management for distributed PyTorch workers in Jupyter notebooks.
+
+This module handles the lifecycle of distributed worker processes, including:
+- Starting worker processes with appropriate GPU assignments
+- Managing process state and communication ports
+- Monitoring process health
+- Graceful shutdown and cleanup
+- Status reporting with GPU information
+
+The ProcessManager works in conjunction with the CommunicationManager to provide
+a robust distributed execution environment for Jupyter notebooks.
 """
 
 import subprocess
@@ -11,7 +21,33 @@ import socket
 
 
 class ProcessManager:
+    """
+    Manager for distributed PyTorch worker processes.
+    
+    This class handles the lifecycle of worker processes that execute distributed
+    PyTorch code. It manages:
+    - Process creation and initialization
+    - GPU assignments
+    - Port allocation
+    - Process monitoring
+    - Graceful shutdown
+    - Status reporting
+    
+    Attributes:
+        processes (List[subprocess.Popen]): List of worker processes
+        num_processes (int): Number of active worker processes
+        master_port (Optional[int]): Port for PyTorch distributed communication
+        comm_port (Optional[int]): Port for ZMQ communication
+        gpu_assignments (dict): Mapping of rank to GPU ID
+    """
+
     def __init__(self):
+        """
+        Initialize the process manager.
+        
+        Creates an empty process manager with no active workers.
+        All ports and GPU assignments will be set when workers are started.
+        """
         self.processes: List[subprocess.Popen] = []
         self.num_processes = 0
         self.master_port = None
@@ -24,12 +60,35 @@ class ProcessManager:
         master_addr: str = "localhost",
         gpu_ids: Optional[List[int]] = None,
     ) -> int:
-        """Start distributed worker processes
-
+        """
+        Start distributed worker processes.
+        
+        This method:
+        1. Finds available ports for communication
+        2. Assigns GPUs to workers (if available)
+        3. Starts worker processes
+        4. Verifies successful startup
+        
         Args:
-            num_processes: Number of worker processes to start
-            master_addr: Master node address
-            gpu_ids: Optional list of GPU IDs to assign to workers. If None, cycles through all available GPUs.
+            num_processes (int): Number of worker processes to start
+            master_addr (str): Master node address (default: "localhost")
+            gpu_ids (Optional[List[int]]): Specific GPU IDs to assign to workers.
+                If None, cycles through all available GPUs.
+                
+        Returns:
+            int: Port number for ZMQ communication
+            
+        Raises:
+            RuntimeError: If any worker fails to start
+            
+        Example:
+            >>> manager = ProcessManager()
+            >>> comm_port = manager.start_workers(4, gpu_ids=[0,1,2,3])
+            Starting 4 worker processes...
+            Worker 0 using GPU 0
+            Worker 1 using GPU 1
+            Worker 2 using GPU 2
+            Worker 3 using GPU 3
         """
         self.num_processes = num_processes
         self.gpu_assignments = {}
@@ -93,7 +152,22 @@ class ProcessManager:
         return self.comm_port
 
     def _find_free_port(self) -> int:
-        """Find a free port"""
+        """
+        Find an available network port.
+        
+        This method:
+        1. Creates a temporary socket
+        2. Binds to port 0 (lets OS choose port)
+        3. Gets the assigned port number
+        4. Closes the socket
+        
+        Returns:
+            int: Available port number
+            
+        Note:
+            There is a small chance the port could be taken between
+            finding it and using it. The caller should handle this case.
+        """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("", 0))
             s.listen(1)
@@ -101,7 +175,23 @@ class ProcessManager:
         return port
 
     def shutdown(self):
-        """Shutdown all worker processes"""
+        """
+        Shutdown all worker processes gracefully.
+        
+        This method attempts a clean shutdown by:
+        1. Sending SIGTERM to each process
+        2. Waiting for processes to exit (with timeout)
+        3. Force killing (SIGKILL) processes that don't exit
+        4. Cleaning up internal state
+        
+        The shutdown is done in stages:
+        - First tries graceful termination (SIGTERM)
+        - Waits up to 3 seconds for each process
+        - Falls back to force kill (SIGKILL) if needed
+        - Waits additional 2 seconds after force kill
+        
+        Any processes that survive even SIGKILL are logged as warnings.
+        """
         print(f"Shutting down {len(self.processes)} worker processes...")
 
         for i, process in enumerate(self.processes):
@@ -137,7 +227,22 @@ class ProcessManager:
         print("Process manager cleanup completed")
 
     def is_running(self) -> bool:
-        """Check if workers are still running"""
+        """
+        Check if any worker processes are still running.
+        
+        This method:
+        1. Returns False if no processes exist
+        2. Checks each process's status
+        3. Cleans up dead processes from the list
+        4. Returns True if any processes are still alive
+        
+        Returns:
+            bool: True if any workers are still running
+            
+        Note:
+            This method has the side effect of cleaning up dead processes
+            from the internal process list.
+        """
         if not self.processes:
             return False
 
@@ -153,7 +258,28 @@ class ProcessManager:
         return len(self.processes) > 0
 
     def get_status(self) -> dict:
-        """Get status of all workers including GPU information"""
+        """
+        Get basic status information for all workers.
+        
+        This method returns static information about each worker:
+        - Process ID
+        - Running state
+        - Exit code (if terminated)
+        - GPU assignment
+        - GPU name (if available)
+        
+        Returns:
+            dict: Status information keyed by worker rank:
+                {
+                    rank: {
+                        "pid": process ID,
+                        "running": bool,
+                        "returncode": exit code or None,
+                        "gpu_id": GPU ID or None,
+                        "gpu_name": GPU name or "CPU"
+                    }
+                }
+        """
         status = {}
         for i, process in enumerate(self.processes):
             gpu_id = self.gpu_assignments.get(i)
@@ -169,7 +295,24 @@ class ProcessManager:
         return status
 
     def _get_gpu_name(self, gpu_id: int) -> str:
-        """Get GPU name for a given GPU ID"""
+        """
+        Get the name of a GPU device.
+        
+        Args:
+            gpu_id (int): GPU device ID
+            
+        Returns:
+            str: GPU device name if available, otherwise a fallback string:
+                - Actual device name (e.g., "NVIDIA A100")
+                - "GPU {id} (unavailable)" if GPU exists but can't be accessed
+                - "GPU {id} (unknown)" if GPU info can't be retrieved
+                
+        Note:
+            This method gracefully handles cases where:
+            - CUDA is not available
+            - The GPU ID is invalid
+            - torch.cuda fails for any reason
+        """
         try:
             import torch
 
@@ -181,7 +324,39 @@ class ProcessManager:
             return f"GPU {gpu_id} (unknown)"
 
     def get_detailed_status(self, comm_manager=None) -> dict:
-        """Get detailed status including live GPU information from workers"""
+        """
+        Get detailed status including live information from workers.
+        
+        This method combines:
+        1. Basic process status information
+        2. Live GPU utilization from workers (if available)
+        3. Additional worker-reported metrics
+        
+        Args:
+            comm_manager: Optional communication manager to get live worker info
+            
+        Returns:
+            dict: Detailed status information keyed by worker rank:
+                {
+                    rank: {
+                        # Basic process info
+                        "pid": process ID,
+                        "running": bool,
+                        "returncode": exit code or None,
+                        "gpu_id": GPU ID or None,
+                        "gpu_name": GPU name or "CPU",
+                        
+                        # Live info (if available)
+                        "gpu_memory_allocated": float,
+                        "gpu_memory_reserved": float,
+                        "gpu_memory_total": float,
+                        ...
+                    }
+                }
+                
+        Note:
+            If communication with workers fails, falls back to basic status info.
+        """
         status = self.get_status()
 
         # If we have a communication manager, get live info from workers
