@@ -419,7 +419,7 @@ class DistributedMagic(Magics):
         return [r for r in ranks if 0 <= r < self._num_processes]
 
     def _display_responses(self, responses: Dict[int, Any], title: str):
-        """Display responses from workers"""
+        """Display responses from workers with enhanced REPL-like formatting"""
         print(f"\n=== {title} ===")
 
         for rank in sorted(responses.keys()):
@@ -432,6 +432,7 @@ class DistributedMagic(Magics):
                     print(response["traceback"])
             else:
                 if response.get("output"):
+                    # The output now includes both stdout and expression results as a single string
                     print(response["output"])
                 else:
                     print("✓ Executed successfully")

@@ -133,23 +133,93 @@ class DistributedWorker:
                 self.socket.send(response)
 
     def _execute_code(self, code: str) -> Dict[str, Any]:
-        """Execute code in worker namespace"""
+        """Execute code in worker namespace with REPL-like behavior"""
         try:
             # Capture stdout
             from io import StringIO
+            import ast
 
             old_stdout = sys.stdout
             sys.stdout = captured_output = StringIO()
 
-            # Execute code
-            exec(code, self.namespace)
+            # First, try to parse the entire code as an expression
+            try:
+                # Try to parse as a single expression first
+                tree = ast.parse(code.strip(), mode='eval')
+                # If it's a single expression, evaluate it and capture the result
+                result = eval(compile(tree, '<string>', 'eval'), self.namespace)
+                
+                # Restore stdout and get output
+                sys.stdout = old_stdout
+                output = captured_output.getvalue()
+                
+                # Format the result like Jupyter does
+                if result is not None:
+                    result_str = repr(result)
+                    if output.strip():
+                        full_output = output + result_str
+                    else:
+                        full_output = result_str
+                else:
+                    full_output = output
+                
+                # Only send string representation, not the actual object (to avoid pickle issues)
+                return {"output": full_output, "status": "success", "rank": self.rank}
+                
+            except SyntaxError:
+                # Not a single expression, parse as statements
+                try:
+                    tree = ast.parse(code, mode='exec')
+                    
+                    # Check if the last node is an expression statement
+                    if (tree.body and 
+                        isinstance(tree.body[-1], ast.Expr)):
+                        
+                        # Split the AST: execute all but the last statement, then evaluate the last expression
+                        if len(tree.body) > 1:
+                            # Execute all statements except the last one
+                            statements_tree = ast.Module(body=tree.body[:-1], type_ignores=[])
+                            exec(compile(statements_tree, '<string>', 'exec'), self.namespace)
+                        
+                        # Evaluate the last expression
+                        last_expr = tree.body[-1].value  # Get the expression from the Expr node
+                        result = eval(compile(ast.Expression(body=last_expr), '<string>', 'eval'), self.namespace)
+                        
+                        # Restore stdout and get output
+                        sys.stdout = old_stdout
+                        output = captured_output.getvalue()
+                        
+                        # Format the result
+                        if result is not None:
+                            result_str = repr(result)
+                            if output.strip():
+                                full_output = output + result_str
+                            else:
+                                full_output = result_str
+                        else:
+                            full_output = output
+                            
+                        # Only send string representation, not the actual object (to avoid pickle issues)
+                        return {"output": full_output, "status": "success", "rank": self.rank}
+                    
+                    else:
+                        # Last statement is not an expression, execute normally
+                        exec(compile(tree, '<string>', 'exec'), self.namespace)
+                        
+                        # Restore stdout and get output
+                        sys.stdout = old_stdout
+                        output = captured_output.getvalue()
+                        
+                        return {"output": output, "status": "success", "rank": self.rank}
+                        
+                except SyntaxError as e:
+                    # If we can't parse it at all, restore stdout and raise the error
+                    sys.stdout = old_stdout
+                    raise e
 
-            # Restore stdout and get output
-            sys.stdout = old_stdout
-            output = captured_output.getvalue()
-
-            return {"output": output, "status": "success", "rank": self.rank}
         except Exception as e:
+            # Restore stdout in case of error
+            sys.stdout = old_stdout
             return {
                 "error": str(e),
                 "traceback": traceback.format_exc(),
