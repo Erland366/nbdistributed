@@ -16,6 +16,7 @@ class DistributedMagic(Magics):
     _process_manager: Optional[ProcessManager] = None
     _comm_manager: Optional[CommunicationManager] = None
     _num_processes: int = 0
+    _distributed_mode_active: bool = False
 
     @line_magic
     @magic_arguments()
@@ -99,15 +100,58 @@ class DistributedMagic(Magics):
                     print(f"  Rank {rank} -> GPU {gpu_id}")
 
             print("Available commands:")
-            print("  %%distributed - Execute code on all ranks")
+            print("  %%distributed - Execute code on all ranks (explicit)")
             print("  %%rank[0,1] - Execute code on specific ranks")
             print("  %sync - Synchronize all ranks")
             print("  %dist_status - Show worker status")
+            print("  %dist_mode - Toggle automatic distributed mode")
             print("  %dist_shutdown - Shutdown workers")
+            print()
+            print("🚀 Distributed mode active: All cells will now execute on workers automatically!")
+            print("   Magic commands (%, %%) will still execute locally as normal.")
+
+            # Enable automatic distributed execution
+            self._enable_distributed_mode()
 
         except Exception as e:
             print(f"Failed to start distributed workers: {e}")
             self.shutdown_all()
+
+    def _enable_distributed_mode(self):
+        """Enable automatic distributed execution using input transformer"""
+        if not self._distributed_mode_active:
+            self.shell.input_transformers_cleanup.append(self._distributed_transformer)
+            self._distributed_mode_active = True
+
+    def _disable_distributed_mode(self):
+        """Disable automatic distributed execution"""
+        if self._distributed_mode_active:
+            try:
+                self.shell.input_transformers_cleanup.remove(self._distributed_transformer)
+            except ValueError:
+                pass  # Already removed
+            self._distributed_mode_active = False
+
+    def _distributed_transformer(self, lines):
+        """Transform non-magic cells to use %%distributed automatically"""
+        if not lines:
+            return lines
+            
+        # Join lines to check the full cell content
+        full_cell = '\n'.join(lines)
+        stripped = full_cell.strip()
+        
+        # Don't transform if:
+        # 1. It's already a magic command
+        # 2. It's empty or whitespace only
+        # 3. It's a comment only
+        if (not stripped or 
+            stripped.startswith('%') or 
+            all(line.strip().startswith('#') or not line.strip() for line in lines)):
+            return lines
+        
+        # Transform by prepending %%distributed
+        return ['%%distributed'] + lines
 
     @line_magic
     def dist_status(self, line):
@@ -166,12 +210,16 @@ class DistributedMagic(Magics):
         print("Shutting down distributed workers (nuclear option)...")
         self.force_shutdown_all()
         
+        # Disable distributed mode
+        self._disable_distributed_mode()
+        
         # CRITICAL: Also clear instance variables since dist_init creates them
         self._process_manager = None
         self._comm_manager = None
         self._num_processes = 0
         
         print("Distributed workers shutdown")
+        print("📱 Normal cell execution restored")
 
     @classmethod
     def force_shutdown_all(cls):
@@ -294,6 +342,9 @@ class DistributedMagic(Magics):
             print("Performing nuclear shutdown...")
             self._nuclear_shutdown()
 
+        # Disable distributed mode
+        self._disable_distributed_mode()
+
         # Force clear everything
         self._comm_manager = None
         self._process_manager = None
@@ -301,6 +352,7 @@ class DistributedMagic(Magics):
 
         print("All state cleared")
         print("You can now run %dist_init to start fresh")
+        print("📱 Normal cell execution restored")
         print("=======================================")
 
     @classmethod
@@ -325,6 +377,10 @@ class DistributedMagic(Magics):
             cls._process_manager = None
 
         cls._num_processes = 0
+        
+        # Note: We don't disable distributed mode here since this is a class method
+        # and we don't have access to the instance. Individual instances should
+        # call _disable_distributed_mode() when they shut down.
 
     @cell_magic
     def distributed(self, line, cell):
@@ -378,6 +434,7 @@ class DistributedMagic(Magics):
         print(f"Process manager exists: {self._process_manager is not None}")
         print(f"Communication manager exists: {self._comm_manager is not None}")
         print(f"Number of processes: {self._num_processes}")
+        print(f"Distributed mode active: {self._distributed_mode_active}")
 
         if self._process_manager:
             print(f"Process manager is_running(): {self._process_manager.is_running()}")
@@ -395,6 +452,44 @@ class DistributedMagic(Magics):
                 print(f"  Process {i} (PID: {process.pid}): {status}")
 
         print("=====================================")
+
+    @line_magic
+    @magic_arguments()
+    @argument(
+        "--enable", "-e", action="store_true", help="Enable distributed mode"
+    )
+    @argument(
+        "--disable", "-d", action="store_true", help="Disable distributed mode"
+    )
+    def dist_mode(self, line):
+        """Toggle distributed mode on/off without affecting workers"""
+        args = parse_argstring(self.dist_mode, line)
+        
+        if not self._comm_manager:
+            print("No distributed workers running. Use %dist_init first.")
+            return
+            
+        if args.enable and args.disable:
+            print("Cannot specify both --enable and --disable")
+            return
+            
+        if args.enable:
+            if not self._distributed_mode_active:
+                self._enable_distributed_mode()
+                print("🚀 Distributed mode enabled: Regular cells will execute on workers")
+            else:
+                print("Distributed mode is already enabled")
+        elif args.disable:
+            if self._distributed_mode_active:
+                self._disable_distributed_mode()
+                print("📱 Distributed mode disabled: Regular cells will execute locally")
+            else:
+                print("Distributed mode is already disabled")
+        else:
+            # Show current status
+            status = "enabled" if self._distributed_mode_active else "disabled"
+            print(f"Distributed mode is currently {status}")
+            print("Use %dist_mode --enable or %dist_mode --disable to toggle")
 
     def _parse_ranks(self, line: str) -> List[int]:
         """Parse rank specification like [0,1,2] or [0-2]"""
