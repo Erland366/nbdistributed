@@ -104,6 +104,8 @@ class DistributedWorker:
                     result = {"status": "synced"}
                 elif message.msg_type == "get_status":
                     result = self._get_status()
+                elif message.msg_type == "get_namespace_info":
+                    result = self._get_namespace_info()
                 else:
                     result = {"error": f"Unknown message type: {message.msg_type}"}
 
@@ -245,6 +247,67 @@ class DistributedWorker:
                 return {"error": f"Variable {var_name} not found"}
         except Exception as e:
             return {"error": str(e)}
+
+    def _get_namespace_info(self) -> Dict[str, Any]:
+        """Get type and signature information for all variables in namespace for IDE integration"""
+        try:
+            import inspect
+            import types
+            
+            namespace_info = {}
+            
+            for name, obj in self.namespace.items():
+                if name.startswith('_'):  # Skip private variables
+                    continue
+                    
+                info = {
+                    "name": name,
+                    "type": type(obj).__name__,
+                    "module": getattr(type(obj), '__module__', None)
+                }
+                
+                # Add specific information based on object type
+                if isinstance(obj, torch.Tensor):
+                    info.update({
+                        "shape": list(obj.shape),
+                        "dtype": str(obj.dtype),
+                        "device": str(obj.device),
+                        "tensor_type": "torch.Tensor"
+                    })
+                elif isinstance(obj, torch.device):
+                    info.update({
+                        "device_type": str(obj.type),
+                        "device_index": obj.index,
+                        "torch_device": True
+                    })
+                elif callable(obj):
+                    try:
+                        sig = inspect.signature(obj)
+                        info.update({
+                            "signature": str(sig),
+                            "callable": True,
+                            "doc": inspect.getdoc(obj)
+                        })
+                    except (ValueError, TypeError):
+                        info["callable"] = True
+                elif isinstance(obj, types.ModuleType):
+                    info.update({
+                        "module_name": obj.__name__,
+                        "module_file": getattr(obj, '__file__', None),
+                        "is_module": True
+                    })
+                elif hasattr(obj, '__class__') and hasattr(obj.__class__, '__name__'):
+                    info.update({
+                        "class_name": obj.__class__.__name__,
+                        "repr": repr(obj) if len(repr(obj)) < 200 else f"{repr(obj)[:200]}..."
+                    })
+                
+                namespace_info[name] = info
+                
+            return {"namespace_info": namespace_info, "status": "success"}
+            
+        except Exception as e:
+            return {"error": str(e), "traceback": traceback.format_exc()}
 
     def _set_variable(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Set variable in namespace"""

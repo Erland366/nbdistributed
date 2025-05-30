@@ -101,7 +101,7 @@ class DistributedMagic(Magics):
 
             print("Available commands:")
             print("  %%distributed - Execute code on all ranks (explicit)")
-            print("  %%rank[0,1] - Execute code on specific ranks")
+            print("  %%rank [0,n] - Execute code on specific ranks")
             print("  %sync - Synchronize all ranks")
             print("  %dist_status - Show worker status")
             print("  %dist_mode - Toggle automatic distributed mode")
@@ -109,6 +109,14 @@ class DistributedMagic(Magics):
             print()
             print("🚀 Distributed mode active: All cells will now execute on workers automatically!")
             print("   Magic commands (%, %%) will still execute locally as normal.")
+            print()
+            print("🐍 Below are auto-imported and special variables auto-generated into the namespace to use")
+            print("  `torch`")
+            print("  `dist`: `torch.distributed` import alias")
+            print("  `rank` (`int`): The local rank")
+            print("  `world_size` (`int`): The global world size")
+            print("  `gpu_id` (`int`): The specific GPU ID assigned to this worker")
+            print("  `device` (`torch.device`): The current PyTorch device object (e.g. `cuda:1`)")
 
             # Enable automatic distributed execution
             self._enable_distributed_mode()
@@ -121,6 +129,11 @@ class DistributedMagic(Magics):
         """Enable automatic distributed execution using input transformer"""
         if not self._distributed_mode_active:
             self.shell.input_transformers_cleanup.append(self._distributed_transformer)
+            
+            # Register post-execution event handler for namespace syncing
+            if hasattr(self.shell, 'events'):
+                self.shell.events.register('post_run_cell', self._post_execution_sync)
+                
             self._distributed_mode_active = True
 
     def _disable_distributed_mode(self):
@@ -130,7 +143,27 @@ class DistributedMagic(Magics):
                 self.shell.input_transformers_cleanup.remove(self._distributed_transformer)
             except ValueError:
                 pass  # Already removed
+                
+            # Unregister the event handler
+            if hasattr(self.shell, 'events'):
+                try:
+                    self.shell.events.unregister('post_run_cell', self._post_execution_sync)
+                except ValueError:
+                    pass  # Already unregistered
+                    
             self._distributed_mode_active = False
+
+    def _post_execution_sync(self, result):
+        """Post-execution handler to sync namespaces for IDE support"""
+        try:
+            # Only sync if the cell was transformed (i.e., it was a regular cell in distributed mode)
+            if (hasattr(result, 'info') and 
+                hasattr(result.info, 'raw_cell') and 
+                result.info.raw_cell and
+                result.info.raw_cell.strip().startswith('%%distributed')):
+                self._sync_namespace_to_local()
+        except Exception:
+            pass  # Silently ignore sync errors
 
     def _distributed_transformer(self, lines):
         """Transform non-magic cells to use %%distributed automatically"""
@@ -392,8 +425,152 @@ class DistributedMagic(Magics):
         try:
             responses = self._comm_manager.send_to_all("execute", cell)
             self._display_responses(responses, "All ranks")
+            
+            # Sync namespace information back to local kernel for IDE support
+            self._sync_namespace_to_local()
+            
         except Exception as e:
             print(f"Error executing distributed code: {e}")
+
+    def _sync_namespace_to_local(self):
+        """Sync variable type information from workers to local IPython kernel for IDE integration"""
+        try:
+            # Get namespace info from rank 0 (representative)
+            response = self._comm_manager.send_to_ranks([0], "get_namespace_info", "")
+            
+            if 0 in response and "namespace_info" in response[0]:
+                namespace_info = response[0]["namespace_info"]
+                self._create_local_proxies(namespace_info)
+                
+        except Exception as e:
+            # Don't fail the main execution, just log the sync issue
+            print(f"Warning: Could not sync namespace for IDE support: {e}")
+
+    def _create_local_proxies(self, namespace_info: Dict[str, Any]):
+        """Create proxy objects in local IPython namespace for IDE integration"""
+        try:
+            import torch
+            from types import ModuleType
+            from typing import Any
+            
+            # Get the IPython shell's user namespace
+            user_ns = self.shell.user_ns
+            
+            for var_name, info in namespace_info.items():
+                # Don't skip built-in distributed variables - they're useful for IDE support
+                # if var_name in ['rank', 'world_size', 'gpu_id', 'device']:
+                #     continue
+                    
+                # Create appropriate proxy based on type
+                if info.get("tensor_type") == "torch.Tensor":
+                    # Create a tensor proxy with the right shape and dtype
+                    try:
+                        shape = info.get("shape", [1])
+                        dtype_str = info.get("dtype", "torch.float32")
+                        dtype = getattr(torch, dtype_str.split('.')[-1], torch.float32)
+                        
+                        # Create a small proxy tensor on CPU
+                        proxy_tensor = torch.zeros(shape, dtype=dtype)
+                        user_ns[var_name] = proxy_tensor
+                        
+                    except Exception:
+                        # Fallback to generic tensor
+                        user_ns[var_name] = torch.tensor([0.0])
+                        
+                elif info.get("torch_device"):
+                    # Create a torch.device proxy
+                    try:
+                        device_type = info.get("device_type", "cpu")
+                        device_index = info.get("device_index")
+                        if device_index is not None:
+                            user_ns[var_name] = torch.device(f"{device_type}:{device_index}")
+                        else:
+                            user_ns[var_name] = torch.device(device_type)
+                    except Exception:
+                        # Fallback to CPU device
+                        user_ns[var_name] = torch.device("cpu")
+                        
+                elif info.get("is_module"):
+                    # For modules, try to import them locally
+                    module_name = info.get("module_name")
+                    if module_name:
+                        try:
+                            # Handle nested module imports properly
+                            if '.' in module_name:
+                                # For modules like torch.distributed, import the root and navigate
+                                root_module = module_name.split('.')[0]
+                                exec(f"import {root_module}", user_ns)
+                                
+                                # Navigate to the nested module
+                                current_obj = user_ns[root_module]
+                                for part in module_name.split('.')[1:]:
+                                    current_obj = getattr(current_obj, part)
+                                
+                                # Assign to the variable name
+                                user_ns[var_name] = current_obj
+                            else:
+                                # Simple import
+                                exec(f"import {module_name}", user_ns)
+                                if var_name != module_name:
+                                    user_ns[var_name] = user_ns[module_name]
+                                    
+                        except (ImportError, AttributeError) as e:
+                            # Create a placeholder module if import fails
+                            placeholder = ModuleType(var_name)
+                            placeholder.__file__ = f"<distributed_proxy:{module_name}>"
+                            placeholder.__doc__ = f"Proxy module for {module_name} (import failed: {e})"
+                            user_ns[var_name] = placeholder
+                            
+                elif info.get("callable"):
+                    # For functions, create a stub with the right signature
+                    signature = info.get("signature", "()")
+                    doc = info.get("doc", "")
+                    
+                    # Clean up the signature for valid Python syntax
+                    if signature and not signature.startswith('('):
+                        signature = f"({signature})"
+                    
+                    # Create a simple stub function
+                    func_code = f"""
+def {var_name}{signature}:
+    '''
+    {doc}
+    
+    Note: This is a proxy function for IDE support.
+    Actual execution happens on distributed workers.
+    '''
+    raise RuntimeError("This is a proxy function for IDE support only")
+"""
+                    try:
+                        exec(func_code, user_ns)
+                    except SyntaxError:
+                        # Fallback for complex signatures
+                        exec(f"def {var_name}(*args, **kwargs): pass", user_ns)
+                        
+                else:
+                    # For other types, create a simple placeholder
+                    type_name = info.get("type", "object")
+                    class_name = info.get("class_name")
+                    
+                    if type_name in ["int", "float", "str", "bool", "list", "dict", "tuple"]:
+                        # Create basic type instances
+                        defaults = {
+                            "int": 0, "float": 0.0, "str": "", "bool": False,
+                            "list": [], "dict": {}, "tuple": ()
+                        }
+                        user_ns[var_name] = defaults.get(type_name, None)
+                    elif class_name:
+                        # Create a placeholder with the right class name (for type hints)
+                        try:
+                            user_ns[var_name] = type(class_name, (), {})()
+                        except:
+                            user_ns[var_name] = None
+                    else:
+                        # Generic placeholder
+                        user_ns[var_name] = None
+                        
+        except Exception as e:
+            print(f"Warning: Error creating local proxies: {e}")
 
     @cell_magic
     def rank(self, line, cell):
@@ -531,3 +708,16 @@ class DistributedMagic(Magics):
                     print(response["output"])
                 else:
                     print("✓ Executed successfully")
+
+    @line_magic
+    def dist_sync_ide(self, line):
+        """Manually sync worker namespaces to local kernel for IDE support"""
+        if not self._comm_manager:
+            print("No distributed workers running. Use %dist_init first.")
+            return
+            
+        try:
+            self._sync_namespace_to_local()
+            print("✓ IDE namespace sync completed")
+        except Exception as e:
+            print(f"❌ Error syncing namespace: {e}")
