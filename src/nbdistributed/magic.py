@@ -102,8 +102,9 @@ class DistributedMagic(Magics):
     _timeline_lock: Optional[threading.Lock] = None  
     _execution_counter: int = 0
     
-    # Streaming buffer for real-time output
-    _streaming_buffer = None
+    # Streaming output organized by rank for better readability
+    _rank_outputs = None  # Dict to collect output by rank
+    _last_displayed_counts = None  # Track what we've already displayed per rank
 
     def __init__(self, shell=None):
         """Initialize the DistributedMagic class with timeline tracking."""
@@ -529,15 +530,15 @@ class DistributedMagic(Magics):
         """
         Handle real-time streaming output from workers.
         
-        Collects output in a buffer that will be polled from the main execution context.
+        Collects output by rank for organized display.
         
         Args:
             rank (int): Worker rank that sent the output
             text (str): Output text
             stream_type (str): Type of stream ("stdout" or "result")
         """
-        # Only stream if we have a buffer
-        if self._streaming_buffer is None:
+        # Only stream if we have buffers initialized
+        if self._rank_outputs is None:
             return
             
         # Filter out system/internal messages that shouldn't be displayed
@@ -562,28 +563,39 @@ class DistributedMagic(Magics):
             text_stripped.startswith('{"application/')):
             return
         
-        # Format the output with rank information
-        if stream_type == "stdout":
-            formatted_text = f"[Rank {rank}] {text_stripped}"
-        elif stream_type == "result":
-            formatted_text = f"[Rank {rank}] {text_stripped}"
-        else:
-            formatted_text = f"[Rank {rank}] {text_stripped}"
+        # Store output by rank (no formatting here - keep it clean)
+        if rank not in self._rank_outputs:
+            self._rank_outputs[rank] = []
         
-        # Just add to buffer - don't print here (wrong context)
-        self._streaming_buffer.append(formatted_text)
+        self._rank_outputs[rank].append(text_stripped)
 
     def _poll_and_display_streaming_output(self):
         """
-        Poll the streaming buffer and display any new output in the current cell context.
+        Poll the rank outputs and display any new output in organized sections.
         """
-        if self._streaming_buffer is None:
+        if self._rank_outputs is None or self._last_displayed_counts is None:
             return
             
-        # Display and clear any buffered output
-        while self._streaming_buffer:
-            output = self._streaming_buffer.pop(0)
-            print(output)
+        # Check each rank for new output
+        for rank in sorted(self._rank_outputs.keys()):
+            rank_output = self._rank_outputs[rank]
+            last_count = self._last_displayed_counts.get(rank, 0)
+            
+            # If there's new output for this rank
+            if len(rank_output) > last_count:
+                new_lines = rank_output[last_count:]
+                
+                # Display new output in a clean, grouped format
+                if last_count == 0:
+                    # First output from this rank - show header
+                    print(f"\n🔹 Rank {rank}:")
+                
+                # Display the new lines without rank prefixes (cleaner)
+                for line in new_lines:
+                    print(f"  {line}")
+                
+                # Update the count of displayed lines for this rank
+                self._last_displayed_counts[rank] = len(rank_output)
 
     def _enable_distributed_mode(self):
         """
@@ -1046,8 +1058,9 @@ class DistributedMagic(Magics):
         cell_id = self._start_cell_execution(cell)
         
         try:
-            # Initialize streaming buffer
-            self._streaming_buffer = []
+            # Initialize streaming buffers for organized output
+            self._rank_outputs = {}
+            self._last_displayed_counts = {}
             
             # Send to all workers with real-time streaming
             import threading
@@ -1100,8 +1113,9 @@ class DistributedMagic(Magics):
             self._record_error_event(cell_id, str(e))
             print(f"Error executing distributed code: {e}")
         finally:
-            # Clear the streaming buffer
-            self._streaming_buffer = None
+            # Clear the streaming buffers
+            self._rank_outputs = None
+            self._last_displayed_counts = None
             # End timeline tracking
             self._end_cell_execution(cell_id)
 
@@ -1462,8 +1476,9 @@ def {var_name}{signature}:
         cell_id = self._start_cell_execution(cell)
         
         try:
-            # Initialize streaming buffer
-            self._streaming_buffer = []
+            # Initialize streaming buffers for organized output
+            self._rank_outputs = {}
+            self._last_displayed_counts = {}
             
             # Send to specified ranks with real-time streaming
             import threading
@@ -1513,8 +1528,9 @@ def {var_name}{signature}:
             self._record_error_event(cell_id, str(e))
             print(f"Error executing code on ranks {ranks}: {e}")
         finally:
-            # Clear the streaming buffer
-            self._streaming_buffer = None
+            # Clear the streaming buffers
+            self._rank_outputs = None
+            self._last_displayed_counts = None
             # End timeline tracking
             self._end_cell_execution(cell_id)
 
