@@ -70,7 +70,8 @@ class DistributedMagic(Magics):
     
     Key Magic Commands:
         %dist_init: Initialize distributed workers
-        %%distributed: Execute code on all ranks
+        %%distributed: Execute code on all ranks (explicit)
+        %%distributed_auto: Execute code on all ranks (automatic)
         %%rank [n]: Execute code on specific ranks
         %sync: Synchronize all ranks
         %dist_status: Show worker status
@@ -100,6 +101,9 @@ class DistributedMagic(Magics):
     _execution_timelines: Optional[Dict[str, CellExecution]] = None
     _timeline_lock: Optional[threading.Lock] = None  
     _execution_counter: int = 0
+    
+    # Streaming buffer for real-time output
+    _streaming_buffer = None
 
     def __init__(self, shell=None):
         """Initialize the DistributedMagic class with timeline tracking."""
@@ -482,8 +486,12 @@ class DistributedMagic(Magics):
                 args.num_processes, args.master_addr, gpu_ids
             )
 
-            # Start communication manager
-            self._comm_manager = CommunicationManager(args.num_processes, comm_port)
+            # Start communication manager with streaming output callback
+            self._comm_manager = CommunicationManager(
+                args.num_processes, 
+                comm_port, 
+                output_callback=self._handle_streaming_output
+            )
             self._num_processes = args.num_processes
 
             print(f"✓ Successfully started {args.num_processes} workers")
@@ -516,6 +524,66 @@ class DistributedMagic(Magics):
         except Exception as e:
             print(f"Failed to start distributed workers: {e}")
             self.shutdown_all()
+
+    def _handle_streaming_output(self, rank: int, text: str, stream_type: str):
+        """
+        Handle real-time streaming output from workers.
+        
+        Collects output in a buffer that will be polled from the main execution context.
+        
+        Args:
+            rank (int): Worker rank that sent the output
+            text (str): Output text
+            stream_type (str): Type of stream ("stdout" or "result")
+        """
+        # Only stream if we have a buffer
+        if self._streaming_buffer is None:
+            return
+            
+        # Filter out system/internal messages that shouldn't be displayed
+        if not text or not text.strip():
+            return
+            
+        # Filter out VS Code and Jupyter internal execution tracking
+        if any(pattern in text for pattern in [
+            'application/vnd.vscode',
+            'execution_count',
+            'cell_id',
+            'msg_id',
+            '{"application/',
+            "'application/",
+        ]):
+            return
+            
+        # Filter out empty dictionaries and system noise, but preserve user data
+        text_stripped = text.strip()
+        if (text_stripped in ['{}', "{''}"] or 
+            text_stripped.startswith("{'application/") or
+            text_stripped.startswith('{"application/')):
+            return
+        
+        # Format the output with rank information
+        if stream_type == "stdout":
+            formatted_text = f"[Rank {rank}] {text_stripped}"
+        elif stream_type == "result":
+            formatted_text = f"[Rank {rank}] {text_stripped}"
+        else:
+            formatted_text = f"[Rank {rank}] {text_stripped}"
+        
+        # Just add to buffer - don't print here (wrong context)
+        self._streaming_buffer.append(formatted_text)
+
+    def _poll_and_display_streaming_output(self):
+        """
+        Poll the streaming buffer and display any new output in the current cell context.
+        """
+        if self._streaming_buffer is None:
+            return
+            
+        # Display and clear any buffered output
+        while self._streaming_buffer:
+            output = self._streaming_buffer.pop(0)
+            print(output)
 
     def _enable_distributed_mode(self):
         """
@@ -978,12 +1046,51 @@ class DistributedMagic(Magics):
         cell_id = self._start_cell_execution(cell)
         
         try:
-            responses = self._comm_manager.send_to_all("execute", cell)
+            # Initialize streaming buffer
+            self._streaming_buffer = []
+            
+            # Send to all workers with real-time streaming
+            import threading
+            import time
+            
+            # Start execution in a separate thread so we can poll for streaming output
+            response_container = {}
+            exception_container = {}
+            
+            def execute_async():
+                try:
+                    response_container['responses'] = self._comm_manager.send_to_all("execute", cell)
+                except Exception as e:
+                    exception_container['error'] = e
+            
+            exec_thread = threading.Thread(target=execute_async)
+            exec_thread.start()
+            
+            # Poll for streaming output while execution is running
+            while exec_thread.is_alive():
+                self._poll_and_display_streaming_output()
+                time.sleep(0.1)  # Poll every 100ms
+            
+            # Final poll after execution completes
+            self._poll_and_display_streaming_output()
+            
+            # Wait for thread to complete and get results
+            exec_thread.join()
+            
+            if 'error' in exception_container:
+                raise exception_container['error']
+                
+            responses = response_container['responses']
             
             # Record timeline events from responses
             self._record_execution_events(cell_id, responses)
             
-            self._display_responses(responses, "All ranks")
+            # Only show errors if any occurred (stdout was already streamed)
+            for rank, response in responses.items():
+                if "error" in response:
+                    print(f"\n❌ Error on Rank {rank}: {response['error']}")
+                    if "traceback" in response:
+                        print(response["traceback"])
             
             # Sync namespace information back to local kernel for IDE support
             self._sync_namespace_to_local()
@@ -993,6 +1100,8 @@ class DistributedMagic(Magics):
             self._record_error_event(cell_id, str(e))
             print(f"Error executing distributed code: {e}")
         finally:
+            # Clear the streaming buffer
+            self._streaming_buffer = None
             # End timeline tracking
             self._end_cell_execution(cell_id)
 
@@ -1353,17 +1462,59 @@ def {var_name}{signature}:
         cell_id = self._start_cell_execution(cell)
         
         try:
-            responses = self._comm_manager.send_to_ranks(ranks, "execute", cell)
+            # Initialize streaming buffer
+            self._streaming_buffer = []
+            
+            # Send to specified ranks with real-time streaming
+            import threading
+            import time
+            
+            # Start execution in a separate thread so we can poll for streaming output
+            response_container = {}
+            exception_container = {}
+            
+            def execute_async():
+                try:
+                    response_container['responses'] = self._comm_manager.send_to_ranks(ranks, "execute", cell)
+                except Exception as e:
+                    exception_container['error'] = e
+            
+            exec_thread = threading.Thread(target=execute_async)
+            exec_thread.start()
+            
+            # Poll for streaming output while execution is running
+            while exec_thread.is_alive():
+                self._poll_and_display_streaming_output()
+                time.sleep(0.1)  # Poll every 100ms
+            
+            # Final poll after execution completes
+            self._poll_and_display_streaming_output()
+            
+            # Wait for thread to complete and get results
+            exec_thread.join()
+            
+            if 'error' in exception_container:
+                raise exception_container['error']
+                
+            responses = response_container['responses']
             
             # Record timeline events from responses
             self._record_execution_events(cell_id, responses)
             
-            self._display_responses(responses, f"Ranks {ranks}")
+            # Only show errors if any occurred (stdout was already streamed)
+            for rank, response in responses.items():
+                if "error" in response:
+                    print(f"\n❌ Error on Rank {rank}: {response['error']}")
+                    if "traceback" in response:
+                        print(response["traceback"])
+            
         except Exception as e:
             # Record error event
             self._record_error_event(cell_id, str(e))
             print(f"Error executing code on ranks {ranks}: {e}")
         finally:
+            # Clear the streaming buffer
+            self._streaming_buffer = None
             # End timeline tracking
             self._end_cell_execution(cell_id)
 

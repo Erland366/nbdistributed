@@ -9,6 +9,7 @@ message passing with features including:
 - Timeout handling
 - Message queuing
 - Worker targeting (all/specific ranks)
+- Real-time streaming output support
 
 The communication is built on ZMQ's ROUTER-DEALER pattern, which enables:
 - Bidirectional communication
@@ -21,7 +22,7 @@ import zmq
 import pickle
 import threading
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Callable, Optional
 from dataclasses import dataclass
 import uuid
 
@@ -33,14 +34,14 @@ class Message:
     
     This class represents a message in the distributed system. It contains:
     - Unique message identifier
-    - Message type (e.g., execute, shutdown)
+    - Message type (e.g., execute, shutdown, stream_output)
     - Source/destination rank
     - Payload data
     - Timestamp for tracking
     
     Attributes:
         msg_id (str): Unique message identifier (UUID)
-        msg_type (str): Type of message (e.g., "execute", "shutdown")
+        msg_type (str): Type of message (e.g., "execute", "shutdown", "stream_output")
         rank (int): Source/destination rank (-1 for coordinator)
         data (Any): Message payload
         timestamp (float): Unix timestamp of message creation
@@ -63,19 +64,21 @@ class Message:
 
 class CommunicationManager:
     """
-    Manager for coordinating communication between processes.
+    Manager for coordinating communication between processes with streaming support.
     
     This class handles all communication between the Jupyter kernel (coordinator)
     and worker processes. It provides:
     - Message routing to specific workers
     - Asynchronous message handling
     - Response collection and timeout management
+    - Real-time streaming output callbacks
     - Clean shutdown handling
     
     The manager uses ZMQ's ROUTER-DEALER pattern where:
     - The coordinator (ROUTER) can send messages to specific workers
     - Workers (DEALERS) are identified by their rank
     - Messages are handled asynchronously in a background thread
+    - Streaming output is processed immediately via callbacks
     
     Attributes:
         num_processes (int): Total number of worker processes
@@ -86,20 +89,24 @@ class CommunicationManager:
         response_events (dict): Events for tracking responses
         running (bool): Control flag for message handler thread
         handler_thread (threading.Thread): Background message processing thread
+        output_callback (Optional[Callable]): Callback for streaming output
     """
 
-    def __init__(self, num_processes: int, base_port: int = 5555):
+    def __init__(self, num_processes: int, base_port: int = 5555, output_callback: Optional[Callable] = None):
         """
         Initialize the communication manager.
         
         Args:
             num_processes (int): Number of worker processes to coordinate
             base_port (int): Base port for ZMQ communication
+            output_callback (Optional[Callable]): Callback function for streaming output
+                Should accept (rank: int, text: str, stream_type: str) parameters
             
         The initialization:
         1. Creates ZMQ context and sockets
         2. Sets up message queuing
-        3. Starts background message handler
+        3. Configures streaming output callback
+        4. Starts background message handler
         
         Note:
             The base_port must be available for binding the ROUTER socket.
@@ -107,6 +114,7 @@ class CommunicationManager:
         """
         self.num_processes = num_processes
         self.base_port = base_port
+        self.output_callback = output_callback
         self.context = zmq.Context()
 
         # Main process acts as coordinator
@@ -123,20 +131,33 @@ class CommunicationManager:
         self.handler_thread.daemon = True
         self.handler_thread.start()
 
+    def set_output_callback(self, callback: Callable[[int, str, str], None]):
+        """
+        Set the callback function for streaming output.
+        
+        Args:
+            callback: Function that takes (rank, text, stream_type) and handles output display
+        """
+        self.output_callback = callback
+
     def _message_handler(self):
         """
-        Background thread for processing incoming messages.
+        Background thread for processing incoming messages with streaming support.
         
         This method runs in a separate thread and:
         1. Polls for incoming messages
         2. Deserializes received messages
-        3. Queues messages by ID
-        4. Signals when all responses are received
+        3. Handles streaming output messages immediately via callback
+        4. Queues response messages by ID
+        5. Signals when all responses are received
         
         The handler uses a 100ms timeout when polling to allow for:
         - Regular checking of the running flag
         - Prevention of busy-waiting
         - Quick shutdown when requested
+        
+        Streaming output messages are processed immediately and not queued,
+        allowing for real-time output display during code execution.
         
         Exceptions in message handling are caught and logged to prevent
         the thread from crashing.
@@ -147,6 +168,19 @@ class CommunicationManager:
                     identity, message = self.coordinator_socket.recv_multipart()
                     msg = pickle.loads(message)
 
+                    # Handle streaming output messages immediately
+                    if msg.msg_type == "stream_output":
+                        if self.output_callback:
+                            try:
+                                data = msg.data
+                                text = data.get("text", "")
+                                stream_type = data.get("stream", "stdout")
+                                self.output_callback(msg.rank, text, stream_type)
+                            except Exception as e:
+                                print(f"Error in output callback: {e}")
+                        continue  # Don't queue streaming messages
+                    
+                    # Handle regular response messages
                     if msg.msg_id not in self.message_queue:
                         self.message_queue[msg.msg_id] = {}
 

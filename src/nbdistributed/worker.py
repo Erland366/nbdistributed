@@ -7,7 +7,7 @@ execution. Each worker:
 - Sets up ZMQ communication with the coordinator
 - Maintains its own Python namespace
 - Executes code sent from the notebook
-- Handles REPL-like behavior for interactive output
+- Handles REPL-like behavior with streaming output support
 
 The workers are managed by the ProcessManager and communicate through the
 CommunicationManager using ZMQ sockets.
@@ -22,7 +22,51 @@ import torch.distributed as dist
 from typing import Any, Dict, Optional
 import traceback
 import time
+import threading
+from io import StringIO
 from nbdistributed.communication import Message
+
+
+class StreamingOutput:
+    """
+    Custom output handler that streams output to coordinator as it's generated.
+    
+    This class intercepts stdout/stderr writes and immediately sends them to the
+    coordinator, enabling real-time output display similar to normal Jupyter behavior.
+    """
+    
+    def __init__(self, socket, rank, msg_id):
+        self.socket = socket
+        self.rank = rank
+        self.msg_id = msg_id
+        self.buffer = StringIO()
+        self._lock = threading.Lock()
+        
+    def write(self, text):
+        if text and text.strip():
+            # Send output immediately to coordinator
+            with self._lock:
+                try:
+                    # Send streaming output message
+                    stream_message = Message(
+                        msg_id=f"{self.msg_id}_stream_{time.time()}",
+                        msg_type="stream_output",
+                        rank=self.rank,
+                        data={"text": text, "stream": "stdout"},
+                        timestamp=time.time()
+                    )
+                    self.socket.send(pickle.dumps(stream_message))
+                except Exception:
+                    pass  # Don't break execution if streaming fails
+        
+        # Also keep in buffer for final result
+        self.buffer.write(text)
+        
+    def flush(self):
+        pass  # No-op for compatibility
+        
+    def getvalue(self):
+        return self.buffer.getvalue()
 
 
 class DistributedWorker:
@@ -34,7 +78,7 @@ class DistributedWorker:
     - Participates in PyTorch distributed training
     - Maintains its own Python namespace
     - Executes code sent from the Jupyter notebook
-    - Captures and returns output in a REPL-like manner
+    - Captures and returns output in a REPL-like manner with streaming support
     
     Attributes:
         rank (int): Global rank of this worker
@@ -142,7 +186,7 @@ class DistributedWorker:
         1. Receives messages from the coordinator
         2. Processes different message types:
            - shutdown: Clean shutdown of the worker
-           - execute: Execute Python code
+           - execute: Execute Python code with streaming output
            - get_var: Retrieve a variable from namespace
            - set_var: Set a variable in namespace
            - sync: Synchronize with other workers
@@ -161,7 +205,7 @@ class DistributedWorker:
                 if message.msg_type == "shutdown":
                     break
                 elif message.msg_type == "execute":
-                    result = self._execute_code(message.data)
+                    result = self._execute_code_streaming(message.data, message.msg_id)
                 elif message.msg_type == "get_var":
                     result = self._get_variable(message.data)
                 elif message.msg_type == "set_var":
@@ -201,47 +245,36 @@ class DistributedWorker:
                 )
                 self.socket.send(response)
 
-    def _execute_code(self, code: str) -> Dict[str, Any]:
+    def _execute_code_streaming(self, code: str, msg_id: str) -> Dict[str, Any]:
         """
-        Execute Python code in the worker's namespace with REPL-like behavior.
+        Execute Python code with streaming output support.
         
-        This method provides Jupyter-like execution where:
-        1. The last expression's value is captured and returned
-        2. Print statements and other output are captured
-        3. The namespace is preserved between executions
-        4. Errors are caught and formatted appropriately
-        
-        The execution strategy:
-        1. First tries to parse code as a single expression
-        2. If that fails, parses as statements with possible final expression
-        3. Captures both stdout and expression values
-        4. Returns formatted output similar to Jupyter
+        This method provides Jupyter-like execution with real-time output where:
+        1. Output is streamed to coordinator as it's generated
+        2. The last expression's value is captured and returned
+        3. Print statements appear immediately during execution
+        4. The namespace is preserved between executions
+        5. Errors are caught and formatted appropriately
         
         Args:
             code (str): Python code to execute
+            msg_id (str): Message ID for tracking streaming output
             
         Returns:
             Dict[str, Any]: Execution result containing:
-                - output: Captured stdout and expression result
+                - output: Final captured output
                 - status: Execution status
                 - rank: Worker rank
                 - error: Error message if execution failed
                 - traceback: Stack trace if execution failed
-        
-        Example:
-            >>> worker._execute_code("print('hello')")
-            {'output': 'hello\\n', 'status': 'success', 'rank': 0}
-            
-            >>> worker._execute_code("2 + 2")
-            {'output': '4', 'status': 'success', 'rank': 0}
         """
         try:
-            # Capture stdout
-            from io import StringIO
             import ast
 
+            # Set up streaming output capture
             old_stdout = sys.stdout
-            sys.stdout = captured_output = StringIO()
+            streaming_output = StreamingOutput(self.socket, self.rank, msg_id)
+            sys.stdout = streaming_output
 
             # First, try to parse the entire code as an expression
             try:
@@ -250,13 +283,26 @@ class DistributedWorker:
                 # If it's a single expression, evaluate it and capture the result
                 result = eval(compile(tree, '<string>', 'eval'), self.namespace)
                 
-                # Restore stdout and get output
+                # Restore stdout and get buffered output
                 sys.stdout = old_stdout
-                output = captured_output.getvalue()
+                output = streaming_output.getvalue()
                 
                 # Format the result like Jupyter does
                 if result is not None:
                     result_str = repr(result)
+                    # Send the result immediately
+                    try:
+                        result_message = Message(
+                            msg_id=f"{msg_id}_result_{time.time()}",
+                            msg_type="stream_output",
+                            rank=self.rank,
+                            data={"text": result_str, "stream": "result"},
+                            timestamp=time.time()
+                        )
+                        self.socket.send(pickle.dumps(result_message))
+                    except Exception:
+                        pass
+                    
                     if output.strip():
                         full_output = output + result_str
                     else:
@@ -286,13 +332,26 @@ class DistributedWorker:
                         last_expr = tree.body[-1].value  # Get the expression from the Expr node
                         result = eval(compile(ast.Expression(body=last_expr), '<string>', 'eval'), self.namespace)
                         
-                        # Restore stdout and get output
+                        # Restore stdout and get buffered output
                         sys.stdout = old_stdout
-                        output = captured_output.getvalue()
+                        output = streaming_output.getvalue()
                         
                         # Format the result
                         if result is not None:
                             result_str = repr(result)
+                            # Send the result immediately
+                            try:
+                                result_message = Message(
+                                    msg_id=f"{msg_id}_result_{time.time()}",
+                                    msg_type="stream_output",
+                                    rank=self.rank,
+                                    data={"text": result_str, "stream": "result"},
+                                    timestamp=time.time()
+                                )
+                                self.socket.send(pickle.dumps(result_message))
+                            except Exception:
+                                pass
+                            
                             if output.strip():
                                 full_output = output + result_str
                             else:
@@ -307,9 +366,9 @@ class DistributedWorker:
                         # Last statement is not an expression, execute normally
                         exec(compile(tree, '<string>', 'exec'), self.namespace)
                         
-                        # Restore stdout and get output
+                        # Restore stdout and get buffered output
                         sys.stdout = old_stdout
-                        output = captured_output.getvalue()
+                        output = streaming_output.getvalue()
                         
                         return {"output": output, "status": "success", "rank": self.rank}
                         
