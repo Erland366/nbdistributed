@@ -12,14 +12,51 @@ Key Features:
 - Transparent communication between processes
 - REPL-like output capturing
 - Automatic namespace synchronization for IDE support
+- Execution timeline tracking for replay capability
 """
 
 from IPython.core.magic import Magics, magics_class, line_magic, cell_magic
 from IPython.core.magic_arguments import argument, magic_arguments, parse_argstring
 from typing import Optional, List, Dict, Any
+import time
+import uuid
+from dataclasses import dataclass, asdict
+from collections import defaultdict
+import threading
+import json
 
 from nbdistributed.process_manager import ProcessManager
 from nbdistributed.communication import CommunicationManager
+
+
+@dataclass
+class TimelineEvent:
+    """Represents a single event in the execution timeline."""
+    timestamp: float
+    event_type: str  # 'start', 'output', 'end', 'error'
+    content: str
+    rank: Optional[int] = None
+    line_number: Optional[int] = None
+    sub_duration: Optional[float] = None  # Duration of this specific event/line
+
+
+@dataclass 
+class CellExecution:
+    """Represents the complete execution of a cell."""
+    cell_id: str
+    start_time: float
+    end_time: Optional[float] = None
+    total_duration: Optional[float] = None
+    events: Optional[List[TimelineEvent]] = None
+    cell_content: str = ""
+    execution_count: int = 0
+    line_durations: Optional[List[float]] = None  # Duration of each line in the cell
+    
+    def __post_init__(self):
+        if self.events is None:
+            self.events = []
+        if self.line_durations is None:
+            self.line_durations = []
 
 
 @magics_class
@@ -39,18 +76,318 @@ class DistributedMagic(Magics):
         %dist_status: Show worker status
         %dist_shutdown: Shutdown workers
         %dist_mode: Toggle automatic distributed mode
+        %timeline_save: Manually save timeline data to notebook metadata
+        %timeline_debug: Show timeline tracking debug information
+        %timeline_clear: Clear all timeline data
+
         
     Class Attributes:
         _process_manager (Optional[ProcessManager]): Manages distributed worker processes
         _comm_manager (Optional[CommunicationManager]): Handles inter-process communication
         _num_processes (int): Number of active distributed processes
         _distributed_mode_active (bool): Whether automatic distributed execution is enabled
+        _execution_timelines (Dict[str, CellExecution]): Timeline data for each cell execution
+        _timeline_lock (threading.Lock): Thread lock for timeline data access
+        _execution_counter (int): Counter for tracking execution order
     """
     
     _process_manager: Optional[ProcessManager] = None
     _comm_manager: Optional[CommunicationManager] = None
     _num_processes: int = 0
     _distributed_mode_active: bool = False
+    
+    # Timeline tracking attributes - will be initialized per instance
+    _execution_timelines: Optional[Dict[str, CellExecution]] = None
+    _timeline_lock: Optional[threading.Lock] = None  
+    _execution_counter: int = 0
+
+    def __init__(self, shell=None):
+        """Initialize the DistributedMagic class with timeline tracking."""
+        super().__init__(shell)
+        
+        # Initialize timeline tracking per instance
+        self._execution_timelines = {}
+        self._timeline_lock = threading.Lock()
+        
+        # Set up notebook save hook to write timeline data to metadata
+        self._setup_notebook_save_hook()
+        
+        # Register timeline tracking handlers immediately (independent of distributed mode)
+        self._register_timeline_handlers()
+
+    def _register_timeline_handlers(self):
+        """Register timeline tracking handlers immediately when the magic class is loaded."""
+        if self.shell is not None and hasattr(self.shell, 'events'):
+            try:
+                self.shell.events.register('pre_run_cell', self._pre_execution_timeline)
+                self.shell.events.register('post_run_cell', self._post_execution_sync)
+            except Exception:
+                pass  # Fail silently if registration fails
+
+    def _setup_notebook_save_hook(self):
+        """Set up a hook to save timeline data to notebook metadata on save."""
+        try:
+            if (self.shell is not None and 
+                hasattr(self.shell, 'kernel') and 
+                hasattr(self.shell.kernel, 'session')):
+                
+                # Try to access the notebook manager through the kernel
+                kernel = self.shell.kernel
+                if hasattr(kernel, 'session') and hasattr(kernel.session, 'session'):
+                    # Register a pre-save hook
+                    self._register_save_hook()
+        except Exception:
+            pass  # Fail silently if we can't set up the hook
+
+    def _register_save_hook(self):
+        """Register a hook to intercept notebook saves and add timeline metadata."""
+        try:
+            # Store the save hook function in the shell for later access
+            if self.shell is not None and hasattr(self.shell, 'user_ns'):
+                # Register a custom save handler
+                self.shell.user_ns['_nb_save_timeline_hook'] = self._save_timeline_to_metadata_hook
+                
+                # Also register with IPython events if available
+                if hasattr(self.shell, 'events'):
+                    # Note: This is a custom approach since IPython doesn't have direct notebook save events
+                    # We'll store the hook and let it be called manually or through other mechanisms
+                    pass
+        except Exception:
+            pass
+
+    def _save_timeline_to_metadata_hook(self):
+        """Hook function to save timeline data to notebook metadata."""
+        try:
+            if not self._execution_timelines:
+                return
+                
+            # Prepare timeline data for serialization
+            timeline_metadata = {}
+            for cell_id, execution in self._execution_timelines.items():
+                timeline_metadata[cell_id] = {
+                    'cell_id': execution.cell_id,
+                    'start_time': execution.start_time,
+                    'end_time': execution.end_time,
+                    'total_duration': execution.total_duration,
+                    'cell_content': execution.cell_content,
+                    'execution_count': execution.execution_count,
+                    'line_durations': execution.line_durations or [],
+                    'events': [
+                        {
+                            'timestamp': event.timestamp,
+                            'event_type': event.event_type,
+                            'content': event.content,
+                            'rank': event.rank,
+                            'line_number': event.line_number,
+                            'sub_duration': event.sub_duration
+                        }
+                        for event in (execution.events or [])
+                    ]
+                }
+            
+            # Store timeline data in a way that can be accessed for notebook saving
+            if self.shell is not None and hasattr(self.shell, 'user_ns'):
+                self.shell.user_ns['_notebook_execution_timelines'] = timeline_metadata
+                
+                # Use IPython's display system to execute JavaScript that modifies notebook metadata
+                try:
+                    from IPython.display import display, Javascript
+                    
+                    # Create JavaScript that updates notebook metadata
+                    js_code = f"""
+                    // Update notebook metadata with timeline data
+                    if (typeof Jupyter !== 'undefined' && Jupyter.notebook) {{
+                        // Initialize execution_timelines if it doesn't exist
+                        if (!Jupyter.notebook.metadata.execution_timelines) {{
+                            Jupyter.notebook.metadata.execution_timelines = {{}};
+                        }}
+                        
+                        // Merge the new timeline data
+                        const newTimelines = {json.dumps(timeline_metadata)};
+                        Object.assign(Jupyter.notebook.metadata.execution_timelines, newTimelines);
+                        
+                        // Mark notebook as dirty so it gets saved
+                        Jupyter.notebook.set_dirty(true);
+                        
+                        // Log success (can be seen in browser console)
+                        console.log('Timeline metadata updated:', Object.keys(newTimelines));
+                    }} else {{
+                        console.log('Jupyter notebook not available for metadata update');
+                    }}
+                    """
+                    
+                    # Display the JavaScript - this will execute in the browser
+                    # We suppress output by using element.remove() at the end
+                    js_code_with_cleanup = f"""
+                    {js_code}
+                    
+                    // Remove the script element to avoid showing output
+                    element.remove();
+                    """
+                    
+                    display(Javascript(js_code_with_cleanup))
+                    
+                except Exception as e:
+                    # Fallback: store in a variable that can be manually saved
+                    self.shell.user_ns['_timeline_metadata_for_save'] = timeline_metadata
+                    
+        except Exception:
+            pass  # Fail silently
+
+    def _save_timeline_to_notebook_metadata(self, cell_execution: CellExecution):
+        """
+        Save timeline data directly to the notebook metadata.
+        
+        Args:
+            cell_execution (CellExecution): The execution timeline to save
+        """
+        try:
+            # Convert timeline to serializable format
+            timeline_data = {
+                'cell_id': cell_execution.cell_id,
+                'start_time': cell_execution.start_time,
+                'end_time': cell_execution.end_time,
+                'total_duration': cell_execution.total_duration,
+                'cell_content': cell_execution.cell_content,
+                'execution_count': cell_execution.execution_count,
+                'events': [
+                    {
+                        'timestamp': event.timestamp,
+                        'event_type': event.event_type,
+                        'content': event.content,
+                        'rank': event.rank,
+                        'line_number': event.line_number
+                    }
+                    for event in (cell_execution.events or [])
+                ]
+            }
+            
+            # Store timeline data with null checks
+            if (self.shell is not None and 
+                hasattr(self.shell, 'user_ns') and 
+                self.shell.user_ns is not None):
+                
+                self.shell.user_ns.setdefault('_nb_execution_timelines', {})
+                self.shell.user_ns['_nb_execution_timelines'][cell_execution.cell_id] = timeline_data
+                
+                # Trigger the save hook to update notebook metadata
+                self._save_timeline_to_metadata_hook()
+                    
+        except Exception as e:
+            # Don't fail execution if metadata saving fails
+            pass
+
+    def _start_cell_execution(self, cell_content: str, execution_count: Optional[int] = None) -> str:
+        """
+        Start tracking execution timeline for a cell.
+        
+        Args:
+            cell_content (str): The content of the cell being executed
+            execution_count (Optional[int]): The actual execution count from the notebook
+            
+        Returns:
+            str: Unique cell execution ID
+        """
+        if self._timeline_lock is None:
+            return ""
+            
+        with self._timeline_lock:
+            # Use provided execution count or increment our counter
+            if execution_count is not None:
+                actual_execution_count = execution_count
+                # Update our counter to match
+                self._execution_counter = max(self._execution_counter, execution_count)
+            else:
+                self._execution_counter += 1
+                actual_execution_count = self._execution_counter
+            
+            cell_id = f"cell_{actual_execution_count}_{uuid.uuid4().hex[:8]}"
+            
+            start_time = time.time()
+            execution = CellExecution(
+                cell_id=cell_id,
+                start_time=start_time,
+                cell_content=cell_content,
+                execution_count=actual_execution_count
+            )
+            
+            # Add start event
+            start_event = TimelineEvent(
+                timestamp=start_time,
+                event_type="start",
+                content=f"Cell execution started"
+            )
+            if execution.events is not None:
+                execution.events.append(start_event)
+            
+            # Store in instance for tracking during execution
+            if self._execution_timelines is not None:
+                self._execution_timelines[cell_id] = execution
+            
+        return cell_id
+
+    def _update_execution_count(self, cell_id: str, execution_count: int) -> Optional[str]:
+        """
+        Update the execution count for a timeline entry.
+        
+        Args:
+            cell_id (str): The cell execution ID
+            execution_count (int): The actual execution count from Jupyter
+            
+        Returns:
+            Optional[str]: The updated cell_id if changed, None otherwise
+        """
+        if self._timeline_lock is None or self._execution_timelines is None:
+            return None
+            
+        with self._timeline_lock:
+            if cell_id in self._execution_timelines:
+                execution = self._execution_timelines[cell_id]
+                execution.execution_count = execution_count
+                
+                # Update the cell_id to reflect the correct execution count
+                new_cell_id = f"cell_{execution_count}_{cell_id.split('_')[-1]}"
+                
+                # Move the timeline entry to the new key
+                if new_cell_id != cell_id:
+                    execution.cell_id = new_cell_id
+                    self._execution_timelines[new_cell_id] = execution
+                    del self._execution_timelines[cell_id]
+                    
+                    # Update our counter to match
+                    self._execution_counter = max(self._execution_counter, execution_count)
+                    return new_cell_id
+                    
+        return None
+
+    def _end_cell_execution(self, cell_id: str):
+        """
+        End tracking execution timeline for a cell and save to notebook metadata.
+        
+        Args:
+            cell_id (str): The cell execution ID
+        """
+        if self._timeline_lock is None or self._execution_timelines is None:
+            return
+            
+        with self._timeline_lock:
+            if cell_id in self._execution_timelines:
+                execution = self._execution_timelines[cell_id]
+                end_time = time.time()
+                execution.end_time = end_time
+                execution.total_duration = end_time - execution.start_time
+                
+                # Add end event
+                end_event = TimelineEvent(
+                    timestamp=end_time,
+                    event_type="end",
+                    content=f"Cell execution completed in {execution.total_duration:.4f}s"
+                )
+                if execution.events is not None:
+                    execution.events.append(end_event)
+                
+                # Save to notebook metadata
+                self._save_timeline_to_notebook_metadata(execution)
 
     @line_magic
     @magic_arguments()
@@ -122,9 +459,8 @@ class DistributedMagic(Magics):
                             return
 
                         if len(gpu_ids) < args.num_processes:
-                            print(
-                                f"❌ Not enough GPU IDs specified. Need {args.num_processes}, got {len(gpu_ids)}"
-                            )
+                            error_msg = f"Not enough GPU IDs specified. Need {args.num_processes}, got {len(gpu_ids)}"
+                            print(f"❌ {error_msg}")
                             print(
                                 "Either specify more GPU IDs or reduce --num-processes"
                             )
@@ -134,9 +470,8 @@ class DistributedMagic(Magics):
                         gpu_ids = None
 
                 except ValueError:
-                    print(
-                        "❌ Invalid GPU IDs format. Use comma-separated integers (e.g., '0,1,3')"
-                    )
+                    error_msg = "Invalid GPU IDs format. Use comma-separated integers (e.g., '0,1,3')"
+                    print(f"❌ {error_msg}")
                     return
 
             print(f"Starting {args.num_processes} distributed workers...")
@@ -191,15 +526,13 @@ class DistributedMagic(Magics):
         
         The function:
         1. Adds an input transformer to prepend %%distributed to regular cells
-        2. Registers a post-execution handler for namespace syncing
-        3. Updates the distributed mode state
+        2. Updates the distributed mode state
+        
+        Note: Timeline tracking is registered separately in __init__ and is always active.
         """
         if not self._distributed_mode_active:
-            self.shell.input_transformers_cleanup.append(self._distributed_transformer)
-            
-            # Register post-execution event handler for namespace syncing
-            if hasattr(self.shell, 'events'):
-                self.shell.events.register('post_run_cell', self._post_execution_sync)
+            if self.shell is not None and hasattr(self.shell, 'input_transformers_cleanup'):
+                self.shell.input_transformers_cleanup.append(self._distributed_transformer)
                 
             self._distributed_mode_active = True
 
@@ -209,43 +542,78 @@ class DistributedMagic(Magics):
         
         Reverts the notebook to normal local execution by:
         1. Removing the distributed input transformer
-        2. Unregistering the post-execution sync handler
-        3. Updating the distributed mode state
+        2. Updating the distributed mode state
+        
+        Note: Timeline tracking handlers remain active and are not unregistered.
         """
         if self._distributed_mode_active:
-            try:
-                self.shell.input_transformers_cleanup.remove(self._distributed_transformer)
-            except ValueError:
-                pass  # Already removed
-                
-            # Unregister the event handler
-            if hasattr(self.shell, 'events'):
+            if self.shell is not None and hasattr(self.shell, 'input_transformers_cleanup'):
                 try:
-                    self.shell.events.unregister('post_run_cell', self._post_execution_sync)
+                    self.shell.input_transformers_cleanup.remove(self._distributed_transformer)
                 except ValueError:
-                    pass  # Already unregistered
+                    pass  # Already removed
                     
             self._distributed_mode_active = False
 
+    def _pre_execution_timeline(self, info):
+        """
+        Pre-execution handler to start timeline tracking for all cells.
+        
+        Args:
+            info: IPython execution info object
+        """
+        try:
+            if hasattr(info, 'raw_cell') and info.raw_cell:
+                cell_content = info.raw_cell.strip()
+                
+                # Don't use execution_count from pre_run_cell as it might not be final
+                # We'll update with the correct execution count in post_execution
+                cell_id = self._start_cell_execution(cell_content, execution_count=None)
+                # Store cell_id in the info object so we can use it in post_execution
+                info._timeline_cell_id = cell_id
+                
+        except Exception:
+            pass  # Silently ignore timeline errors
+
     def _post_execution_sync(self, result):
         """
-        Post-execution handler to sync namespaces for IDE support.
+        Post-execution handler to sync namespaces for IDE support and finish timeline tracking.
         
         After a cell executes in distributed mode, this handler:
         1. Checks if the cell was transformed for distributed execution
         2. If so, syncs the namespace from workers to the local kernel
         3. Enables IDE features like autocomplete for distributed variables
+        4. Finishes timeline tracking for regular cells
         
         Args:
             result: IPython execution result object
         """
         try:
-            # Only sync if the cell was transformed (i.e., it was a regular cell in distributed mode)
+            # Handle timeline tracking for regular cells
+            if (hasattr(result, 'info') and 
+                hasattr(result.info, '_timeline_cell_id')):
+                cell_id = result.info._timeline_cell_id
+                
+                # Update execution count with the actual execution count from the result
+                if hasattr(result, 'execution_count') and result.execution_count is not None:
+                    updated_cell_id = self._update_execution_count(cell_id, result.execution_count)
+                    cell_id = updated_cell_id or cell_id  # Use updated cell_id if available
+                
+                # Record the execution output and finish timeline
+                if hasattr(result, 'result') and result.result is not None:
+                    # Record the final result
+                    self._record_local_execution_result(cell_id, str(result.result))
+                
+                # End timeline tracking
+                self._end_cell_execution(cell_id)
+            
+            # Only sync if the cell was transformed for distributed execution
             if (hasattr(result, 'info') and 
                 hasattr(result.info, 'raw_cell') and 
                 result.info.raw_cell and
                 result.info.raw_cell.strip().startswith('%%distributed')):
-                self._sync_namespace_to_local()
+                if self._comm_manager is not None:
+                    self._sync_namespace_to_local()
         except Exception:
             pass  # Silently ignore sync errors
 
@@ -591,6 +959,7 @@ class DistributedMagic(Magics):
         1. Sends the code to all worker processes
         2. Collects and displays results from each rank
         3. Syncs the namespace back to the local kernel
+        4. Records execution timeline for replay
         
         Args:
             line (str): Line magic arguments (unused)
@@ -605,15 +974,27 @@ class DistributedMagic(Magics):
             print("No distributed workers running. Use %dist_init first.")
             return
 
+        # Start timeline tracking
+        cell_id = self._start_cell_execution(cell)
+        
         try:
             responses = self._comm_manager.send_to_all("execute", cell)
+            
+            # Record timeline events from responses
+            self._record_execution_events(cell_id, responses)
+            
             self._display_responses(responses, "All ranks")
             
             # Sync namespace information back to local kernel for IDE support
             self._sync_namespace_to_local()
             
         except Exception as e:
+            # Record error event
+            self._record_error_event(cell_id, str(e))
             print(f"Error executing distributed code: {e}")
+        finally:
+            # End timeline tracking
+            self._end_cell_execution(cell_id)
 
     def _sync_namespace_to_local(self):
         """
@@ -629,11 +1010,12 @@ class DistributedMagic(Magics):
         """
         try:
             # Get namespace info from rank 0 (representative)
-            response = self._comm_manager.send_to_ranks([0], "get_namespace_info", "")
-            
-            if 0 in response and "namespace_info" in response[0]:
-                namespace_info = response[0]["namespace_info"]
-                self._create_local_proxies(namespace_info)
+            if self._comm_manager is not None and hasattr(self._comm_manager, 'send_to_ranks'):
+                response = self._comm_manager.send_to_ranks([0], "get_namespace_info", "")
+                
+                if 0 in response and "namespace_info" in response[0]:
+                    namespace_info = response[0]["namespace_info"]
+                    self._create_local_proxies(namespace_info)
                 
         except Exception as e:
             # Don't fail the main execution, just log the sync issue
@@ -658,6 +1040,8 @@ class DistributedMagic(Magics):
             from typing import Any
             
             # Get the IPython shell's user namespace
+            if self.shell is None or not hasattr(self.shell, 'user_ns'):
+                return
             user_ns = self.shell.user_ns
             
             for var_name, info in namespace_info.items():
@@ -776,6 +1160,166 @@ def {var_name}{signature}:
         except Exception as e:
             print(f"Warning: Error creating local proxies: {e}")
 
+    def _record_execution_events(self, cell_id: str, responses: Dict[int, Any]):
+        """
+        Record execution events from worker responses with line-by-line timing.
+        
+        Args:
+            cell_id (str): The cell execution ID
+            responses (Dict[int, Any]): Responses from workers
+        """
+        if self._timeline_lock is None or self._execution_timelines is None:
+            return
+            
+        with self._timeline_lock:
+            if cell_id not in self._execution_timelines:
+                return
+                
+            execution = self._execution_timelines[cell_id]
+            
+            # Calculate line durations based on cell content
+            if execution.cell_content and execution.line_durations is not None:
+                cell_lines = execution.cell_content.strip().split('\n')
+                line_count = len([line for line in cell_lines if line.strip()])  # Non-empty lines
+                
+                # Estimate duration per line (we'll refine this with actual execution data)
+                if execution.total_duration and line_count > 0:
+                    avg_line_duration = execution.total_duration / line_count
+                    execution.line_durations = [avg_line_duration] * line_count
+            
+            for rank, response in responses.items():
+                base_timestamp = time.time()
+                
+                if "error" in response:
+                    # Record error event with sub-duration
+                    error_duration = 0.001  # Small duration for error events
+                    error_event = TimelineEvent(
+                        timestamp=base_timestamp,
+                        event_type="error",
+                        content=response["error"],
+                        rank=rank,
+                        sub_duration=error_duration
+                    )
+                    if execution.events is not None:
+                        execution.events.append(error_event)
+                    
+                    if "traceback" in response:
+                        traceback_duration = 0.002  # Slightly longer for traceback
+                        traceback_event = TimelineEvent(
+                            timestamp=base_timestamp + error_duration,
+                            event_type="error",
+                            content=response["traceback"],
+                            rank=rank,
+                            sub_duration=traceback_duration
+                        )
+                        if execution.events is not None:
+                            execution.events.append(traceback_event)
+                else:
+                    # Record output events with calculated line durations
+                    if response.get("output"):
+                        output_lines = response["output"].strip().split('\n')
+                        cumulative_time = 0.0
+                        
+                        for i, line in enumerate(output_lines):
+                            if line.strip():  # Skip empty lines
+                                # Calculate sub-duration for this line
+                                line_duration = self._calculate_line_duration(line, execution.line_durations, i)
+                                
+                                output_event = TimelineEvent(
+                                    timestamp=base_timestamp + cumulative_time,
+                                    event_type="output",
+                                    content=line,
+                                    rank=rank,
+                                    line_number=i + 1,
+                                    sub_duration=line_duration
+                                )
+                                if execution.events is not None:
+                                    execution.events.append(output_event)
+                                
+                                cumulative_time += line_duration
+
+    def _calculate_line_duration(self, line: str, line_durations: Optional[List[float]], line_index: int) -> float:
+        """
+        Calculate the duration for a specific line based on content and context.
+        
+        Args:
+            line (str): The line content
+            line_durations (Optional[List[float]]): Pre-calculated line durations
+            line_index (int): Index of the line
+            
+        Returns:
+            float: Duration in seconds for this line
+        """
+        # If we have pre-calculated durations, use them
+        if line_durations and line_index < len(line_durations):
+            return line_durations[line_index]
+        
+        # Otherwise, estimate based on content
+        base_duration = 0.001  # 1ms base
+        
+        # Adjust based on line content
+        if any(keyword in line.lower() for keyword in ['print', 'display']):
+            return base_duration * 2  # Print statements take a bit longer
+        elif any(keyword in line.lower() for keyword in ['import', 'from']):
+            return base_duration * 5  # Imports take longer
+        elif any(keyword in line.lower() for keyword in ['torch', 'cuda', 'gpu']):
+            return base_duration * 3  # GPU operations take longer
+        elif len(line.strip()) > 50:
+            return base_duration * 2  # Longer lines take more time
+        else:
+            return base_duration
+
+    def _record_error_event(self, cell_id: str, error_message: str):
+        """
+        Record an error event in the timeline.
+        
+        Args:
+            cell_id (str): The cell execution ID
+            error_message (str): The error message
+        """
+        if self._timeline_lock is None or self._execution_timelines is None:
+            return
+            
+        with self._timeline_lock:
+            if cell_id not in self._execution_timelines:
+                return
+                
+            execution = self._execution_timelines[cell_id]
+            error_event = TimelineEvent(
+                timestamp=time.time(),
+                event_type="error",
+                content=error_message,
+                sub_duration=0.001  # Small duration for error events
+            )
+            if execution.events is not None:
+                execution.events.append(error_event)
+
+    def _record_local_execution_result(self, cell_id: str, result_content: str):
+        """
+        Record the result of a local cell execution.
+        
+        Args:
+            cell_id (str): The cell execution ID
+            result_content (str): The result content
+        """
+        if self._timeline_lock is None or self._execution_timelines is None:
+            return
+            
+        with self._timeline_lock:
+            if cell_id not in self._execution_timelines:
+                return
+                
+            execution = self._execution_timelines[cell_id]
+            result_event = TimelineEvent(
+                timestamp=time.time(),
+                event_type="output",
+                content=result_content,
+                line_number=1,
+                sub_duration=self._calculate_line_duration(result_content, execution.line_durations, 0)
+            )
+            if execution.events is not None:
+                execution.events.append(result_event)
+
     @cell_magic
     def rank(self, line, cell):
         """
@@ -785,6 +1329,7 @@ def {var_name}{signature}:
         1. Parses rank specification (e.g., [0,1] or [0-2])
         2. Sends code only to specified ranks
         3. Displays results from those ranks
+        4. Records execution timeline for replay
         
         Args:
             line (str): Rank specification (e.g., "[0,1,2]" or "[0-2]")
@@ -804,11 +1349,23 @@ def {var_name}{signature}:
             print("Invalid rank specification. Use: %%rank[0,1,2] or %%rank[0-2]")
             return
 
+        # Start timeline tracking
+        cell_id = self._start_cell_execution(cell)
+        
         try:
             responses = self._comm_manager.send_to_ranks(ranks, "execute", cell)
+            
+            # Record timeline events from responses
+            self._record_execution_events(cell_id, responses)
+            
             self._display_responses(responses, f"Ranks {ranks}")
         except Exception as e:
+            # Record error event
+            self._record_error_event(cell_id, str(e))
             print(f"Error executing code on ranks {ranks}: {e}")
+        finally:
+            # End timeline tracking
+            self._end_cell_execution(cell_id)
 
     @line_magic
     def sync(self, line):
@@ -1020,3 +1577,99 @@ def {var_name}{signature}:
             print("✓ IDE namespace sync completed")
         except Exception as e:
             print(f"❌ Error syncing namespace: {e}")
+
+    @line_magic
+    def timeline_save(self, line):
+        """
+        Manually save timeline data to notebook metadata.
+        
+        This magic:
+        1. Forces the timeline data to be saved to notebook metadata
+        2. Displays the current timeline data for verification
+        
+        Example:
+            >>> %timeline_save
+        """
+        try:
+            # Force save the timeline metadata
+            self._save_timeline_to_metadata_hook()
+            
+            # Show current timeline data
+            if self._execution_timelines:
+                print(f"📊 Timeline data for {len(self._execution_timelines)} cell executions:")
+                for cell_id, execution in self._execution_timelines.items():
+                    print(f"  • {cell_id}: {execution.total_duration:.4f}s ({len(execution.events or [])} events)")
+                print("\n✅ Timeline metadata saved to notebook")
+            else:
+                print("📊 No timeline data available yet")
+                
+            # Also show what's in user_ns for debugging
+            if (self.shell is not None and 
+                hasattr(self.shell, 'user_ns') and 
+                '_notebook_execution_timelines' in self.shell.user_ns):
+                timeline_data = self.shell.user_ns['_notebook_execution_timelines']
+                print(f"🔍 Found {len(timeline_data)} timeline entries in user namespace")
+            
+        except Exception as e:
+            print(f"❌ Error saving timeline: {e}")
+
+    @line_magic  
+    def timeline_debug(self, line):
+        """
+        Show debug information about timeline tracking.
+        
+        Example:
+            >>> %timeline_debug
+        """
+        print("=== Timeline Debug Information ===")
+        print(f"Timeline tracking active: {self._execution_timelines is not None}")
+        if self._execution_timelines:
+            print(f"Tracked executions: {len(self._execution_timelines)}")
+            for cell_id, execution in self._execution_timelines.items():
+                print(f"  {cell_id}:")
+                print(f"    Duration: {execution.total_duration or 'N/A'}")
+                print(f"    Events: {len(execution.events or [])}")
+                if execution.line_durations:
+                    durations_str = ", ".join(f"{d:.6f}s" for d in execution.line_durations[:5])
+                    if len(execution.line_durations) > 5:
+                        durations_str += f" ... ({len(execution.line_durations)} total)"
+                    print(f"    Line durations: [{durations_str}]")
+                else:
+                    print(f"    Content preview: {execution.cell_content[:50]}...")
+        
+        # Check user namespace
+        if (self.shell is not None and 
+            hasattr(self.shell, 'user_ns')):
+            
+            if '_notebook_execution_timelines' in self.shell.user_ns:
+                saved_data = self.shell.user_ns['_notebook_execution_timelines']
+                print(f"\nSaved timeline data: {len(saved_data)} entries")
+            else:
+                print("\nNo saved timeline data in user namespace")
+                
+        print("=====================================")
+
+    @line_magic
+    def timeline_clear(self, line):
+        """
+        Clear all timeline data.
+        
+        Example:
+            >>> %timeline_clear
+        """
+        if self._execution_timelines:
+            count = len(self._execution_timelines)
+            self._execution_timelines.clear()
+            print(f"🗑️ Cleared {count} timeline entries")
+        else:
+            print("📊 No timeline data to clear")
+            
+        # Also clear from user namespace
+        if (self.shell is not None and 
+            hasattr(self.shell, 'user_ns')):
+            for key in ['_notebook_execution_timelines', '_timeline_metadata_for_save']:
+                if key in self.shell.user_ns:
+                    del self.shell.user_ns[key]
+                    print(f"🗑️ Cleared {key} from user namespace")
+
+
