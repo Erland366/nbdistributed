@@ -1138,7 +1138,9 @@ class DistributedMagic(Magics):
                 
                 if 0 in response and "namespace_info" in response[0]:
                     namespace_info = response[0]["namespace_info"]
-                    self._create_local_proxies(namespace_info)
+                    # Only attempt proxy creation if we have actual namespace data
+                    if namespace_info:
+                        self._create_local_proxies(namespace_info)
                 
         except Exception as e:
             # Don't fail the main execution, just log the sync issue
@@ -1160,7 +1162,6 @@ class DistributedMagic(Magics):
         try:
             import torch
             from types import ModuleType
-            from typing import Any
             
             # Get the IPython shell's user namespace
             if self.shell is None or not hasattr(self.shell, 'user_ns'):
@@ -1210,7 +1211,11 @@ class DistributedMagic(Magics):
                             if '.' in module_name:
                                 # For modules like torch.distributed, import the root and navigate
                                 root_module = module_name.split('.')[0]
-                                exec(f"import {root_module}", user_ns)
+                                # Import safely with a local namespace that includes globals
+                                safe_ns = dict(user_ns)
+                                safe_ns.update(globals())
+                                exec(f"import {root_module}", safe_ns)
+                                user_ns[root_module] = safe_ns[root_module]
                                 
                                 # Navigate to the nested module
                                 current_obj = user_ns[root_module]
@@ -1221,7 +1226,10 @@ class DistributedMagic(Magics):
                                 user_ns[var_name] = current_obj
                             else:
                                 # Simple import
-                                exec(f"import {module_name}", user_ns)
+                                safe_ns = dict(user_ns)
+                                safe_ns.update(globals())
+                                exec(f"import {module_name}", safe_ns)
+                                user_ns[module_name] = safe_ns[module_name]
                                 if var_name != module_name:
                                     user_ns[var_name] = user_ns[module_name]
                                     
@@ -1253,10 +1261,20 @@ def {var_name}{signature}:
     raise RuntimeError("This is a proxy function for IDE support only")
 """
                     try:
-                        exec(func_code, user_ns)
+                        # Use safe namespace for exec
+                        safe_ns = dict(user_ns)
+                        safe_ns.update(globals())
+                        exec(func_code, safe_ns)
+                        # Only copy the function we created back to user_ns
+                        if var_name in safe_ns:
+                            user_ns[var_name] = safe_ns[var_name]
                     except SyntaxError:
                         # Fallback for complex signatures
-                        exec(f"def {var_name}(*args, **kwargs): pass", user_ns)
+                        safe_ns = dict(user_ns)
+                        safe_ns.update(globals())
+                        exec(f"def {var_name}(*args, **kwargs): pass", safe_ns)
+                        if var_name in safe_ns:
+                            user_ns[var_name] = safe_ns[var_name]
                         
                 else:
                     # For other types, create a simple placeholder
@@ -1281,7 +1299,10 @@ def {var_name}{signature}:
                         user_ns[var_name] = None
                         
         except Exception as e:
-            print(f"Warning: Error creating local proxies: {e}")
+            # Silently skip proxy creation if it fails due to typing issues
+            # This commonly happens when cells have no output and typing internals are not accessible
+            if "_T_co" not in str(e):
+                print(f"Warning: Error creating local proxies: {e}")
 
     def _record_execution_events(self, cell_id: str, responses: Dict[int, Any]):
         """
