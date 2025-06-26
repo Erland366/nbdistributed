@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nbdistributed"
-version = "0.0.1"
+version = "0.1.0"
 description = "Jupyter extension for interactive distributed PyTorch training"
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
 authors = [
-    { name = "Zach Mueller", email = "zach@example.com" }
+    { name = "Zach Mueller", email = "walkwithcode@gmail.com" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
