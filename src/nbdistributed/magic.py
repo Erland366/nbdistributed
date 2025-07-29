@@ -409,6 +409,13 @@ class DistributedMagic(Magics):
         default=None,
         help="Comma-separated list of GPU IDs to use (e.g., '0,1,3'). If not specified, cycles through all available GPUs.",
     )
+    @argument(
+        "--timeout",
+        "-t",
+        type=float,
+        default=30.0,
+        help="Default timeout for communication operations in seconds (default: 30.0)",
+    )
     def dist_init(self, line):
         """
         Initialize distributed workers for parallel execution.
@@ -424,9 +431,10 @@ class DistributedMagic(Magics):
                 --num-processes/-n: Number of worker processes (default: 2)
                 --master-addr/-a: Master node address (default: localhost)
                 --gpu-ids/-g: Specific GPU IDs to use (e.g., "0,1,3")
+                --timeout/-t: Default timeout for communication operations in seconds (default: 30.0)
                 
         Example:
-            >>> %dist_init -n 4 -g "0,1,2,3"
+            >>> %dist_init -n 4 -g "0,1,2,3" -t 60.0
             Starting 4 distributed workers...
             ✓ Successfully started 4 workers
             Rank 0 -> GPU 0
@@ -491,7 +499,8 @@ class DistributedMagic(Magics):
             self._comm_manager = CommunicationManager(
                 args.num_processes, 
                 comm_port, 
-                output_callback=self._handle_streaming_output
+                output_callback=self._handle_streaming_output,
+                default_timeout=args.timeout
             )
             self._num_processes = args.num_processes
 

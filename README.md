@@ -144,14 +144,31 @@ Specify exact GPU-to-rank mapping:
 %dist_init -n 4 -g "0,1,2,3"  # Assign specific GPUs
 ```
 
-### 2. Namespace Synchronization
+### 2. Timeout Configuration
+
+Configure communication timeout for long-running operations:
+```python
+%dist_init -n 4 -t 60.0  # Set 60-second timeout for communications
+```
+
+The timeout controls how long the coordinator waits for worker responses during:
+- Code execution
+- Synchronization operations  
+- Status checks
+
+Default timeout is 30 seconds, but you may need longer for:
+- Complex model initialization
+- Large data loading operations
+- Memory-intensive computations
+
+### 3. Namespace Synchronization
 
 The library automatically syncs worker namespaces to enable IDE features:
 - Code completion
 - Type hints
 - Variable inspection
 
-### 3. Error Handling
+### 4. Error Handling
 
 Errors are caught and reported with:
 - Full traceback

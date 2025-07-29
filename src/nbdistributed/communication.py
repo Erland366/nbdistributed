@@ -92,7 +92,7 @@ class CommunicationManager:
         output_callback (Optional[Callable]): Callback for streaming output
     """
 
-    def __init__(self, num_processes: int, base_port: int = 5555, output_callback: Optional[Callable] = None):
+    def __init__(self, num_processes: int, base_port: int = 5555, output_callback: Optional[Callable] = None, default_timeout: float = 30.0):
         """
         Initialize the communication manager.
         
@@ -101,6 +101,7 @@ class CommunicationManager:
             base_port (int): Base port for ZMQ communication
             output_callback (Optional[Callable]): Callback function for streaming output
                 Should accept (rank: int, text: str, stream_type: str) parameters
+            default_timeout (float): Default timeout for communication operations in seconds
             
         The initialization:
         1. Creates ZMQ context and sockets
@@ -115,6 +116,7 @@ class CommunicationManager:
         self.num_processes = num_processes
         self.base_port = base_port
         self.output_callback = output_callback
+        self.default_timeout = default_timeout
         self.context = zmq.Context()
 
         # Main process acts as coordinator
@@ -199,7 +201,7 @@ class CommunicationManager:
                 print(f"Error in message handler: {e}")
 
     def send_to_all(
-        self, msg_type: str, data: Any, timeout: float = 30.0
+        self, msg_type: str, data: Any, timeout: Optional[float] = None
     ) -> Dict[int, Any]:
         """
         Send a message to all workers and collect responses.
@@ -213,7 +215,8 @@ class CommunicationManager:
         Args:
             msg_type (str): Type of message to send
             data (Any): Data payload for the message
-            timeout (float): Maximum time to wait for responses
+            timeout (Optional[float]): Maximum time to wait for responses. 
+                If None, uses the default_timeout set during initialization.
             
         Returns:
             Dict[int, Any]: Responses from workers, keyed by rank
@@ -226,6 +229,8 @@ class CommunicationManager:
             >>> print(responses)
             {0: {'output': '0\\n'}, 1: {'output': '1\\n'}}
         """
+        if timeout is None:
+            timeout = self.default_timeout
         msg_id = str(uuid.uuid4())
         message = Message(
             msg_id=msg_id,
@@ -254,7 +259,7 @@ class CommunicationManager:
             raise TimeoutError(f"Timeout waiting for responses to {msg_id}")
 
     def send_to_rank(
-        self, rank: int, msg_type: str, data: Any, timeout: float = 30.0
+        self, rank: int, msg_type: str, data: Any, timeout: Optional[float] = None
     ) -> Any:
         """
         Send a message to a specific worker rank.
@@ -266,7 +271,8 @@ class CommunicationManager:
             rank (int): Worker rank to send to
             msg_type (str): Type of message to send
             data (Any): Data payload for the message
-            timeout (float): Maximum time to wait for response
+            timeout (Optional[float]): Maximum time to wait for response.
+                If None, uses the default_timeout set during initialization.
             
         Returns:
             Any: Response data from the worker
@@ -283,7 +289,7 @@ class CommunicationManager:
         return responses[rank]
 
     def send_to_ranks(
-        self, ranks: List[int], msg_type: str, data: Any, timeout: float = 30.0
+        self, ranks: List[int], msg_type: str, data: Any, timeout: Optional[float] = None
     ) -> Dict[int, Any]:
         """
         Send a message to specific worker ranks.
@@ -298,7 +304,8 @@ class CommunicationManager:
             ranks (List[int]): List of worker ranks to send to
             msg_type (str): Type of message to send
             data (Any): Data payload for the message
-            timeout (float): Maximum time to wait for responses
+            timeout (Optional[float]): Maximum time to wait for responses.
+                If None, uses the default_timeout set during initialization.
             
         Returns:
             Dict[int, Any]: Responses from workers, keyed by rank
@@ -311,6 +318,8 @@ class CommunicationManager:
             >>> print(responses)
             {0: {'output': '0\\n'}, 2: {'output': '2\\n'}}
         """
+        if timeout is None:
+            timeout = self.default_timeout
         msg_id = str(uuid.uuid4())
         message = Message(
             msg_id=msg_id, msg_type=msg_type, rank=-1, data=data, timestamp=time.time()
