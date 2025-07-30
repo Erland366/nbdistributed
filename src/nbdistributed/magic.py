@@ -413,8 +413,8 @@ class DistributedMagic(Magics):
         "--timeout",
         "-t",
         type=float,
-        default=30.0,
-        help="Default timeout for communication operations in seconds (default: 30.0)",
+        default=None,
+        help="Default timeout for communication operations in seconds. Set to None to disable timeouts (useful for training scenarios, default: None)",
     )
     def dist_init(self, line):
         """
@@ -431,7 +431,7 @@ class DistributedMagic(Magics):
                 --num-processes/-n: Number of worker processes (default: 2)
                 --master-addr/-a: Master node address (default: localhost)
                 --gpu-ids/-g: Specific GPU IDs to use (e.g., "0,1,3")
-                --timeout/-t: Default timeout for communication operations in seconds (default: 30.0)
+                --timeout/-t: Default timeout for communication operations in seconds. Set to None to disable timeouts (useful for training scenarios, default: None)
                 
         Example:
             >>> %dist_init -n 4 -g "0,1,2,3" -t 60.0

@@ -6,7 +6,7 @@ This module implements the communication infrastructure between the coordinator
 message passing with features including:
 - Asynchronous message handling
 - Request-response pattern
-- Timeout handling
+- Optional timeout handling (can be disabled for training scenarios)
 - Message queuing
 - Worker targeting (all/specific ranks)
 - Real-time streaming output support
@@ -92,7 +92,7 @@ class CommunicationManager:
         output_callback (Optional[Callable]): Callback for streaming output
     """
 
-    def __init__(self, num_processes: int, base_port: int = 5555, output_callback: Optional[Callable] = None, default_timeout: float = 30.0):
+    def __init__(self, num_processes: int, base_port: int = 5555, output_callback: Optional[Callable] = None, default_timeout: float = None):
         """
         Initialize the communication manager.
         
@@ -101,7 +101,8 @@ class CommunicationManager:
             base_port (int): Base port for ZMQ communication
             output_callback (Optional[Callable]): Callback function for streaming output
                 Should accept (rank: int, text: str, stream_type: str) parameters
-            default_timeout (float): Default timeout for communication operations in seconds
+            default_timeout (float): Default timeout for communication operations in seconds.
+                Set to None to disable timeouts (useful for training scenarios).
             
         The initialization:
         1. Creates ZMQ context and sockets
@@ -217,12 +218,13 @@ class CommunicationManager:
             data (Any): Data payload for the message
             timeout (Optional[float]): Maximum time to wait for responses. 
                 If None, uses the default_timeout set during initialization.
+                If default_timeout is also None, waits indefinitely.
             
         Returns:
             Dict[int, Any]: Responses from workers, keyed by rank
             
         Raises:
-            TimeoutError: If not all workers respond within timeout
+            TimeoutError: If not all workers respond within timeout (only when timeout is set)
             
         Example:
             >>> responses = manager.send_to_all("execute", "print(rank)")
@@ -250,13 +252,21 @@ class CommunicationManager:
             self.coordinator_socket.send_multipart([worker_id, serialized])
 
         # Wait for all responses
-        if self.response_events[msg_id].wait(timeout):
+        if timeout is not None:
+            if self.response_events[msg_id].wait(timeout):
+                responses = self.message_queue[msg_id]
+                del self.message_queue[msg_id]
+                del self.response_events[msg_id]
+                return {rank: msg.data for rank, msg in responses.items()}
+            else:
+                raise TimeoutError(f"Timeout waiting for responses to {msg_id}")
+        else:
+            # Wait indefinitely when no timeout is set
+            self.response_events[msg_id].wait()
             responses = self.message_queue[msg_id]
             del self.message_queue[msg_id]
             del self.response_events[msg_id]
             return {rank: msg.data for rank, msg in responses.items()}
-        else:
-            raise TimeoutError(f"Timeout waiting for responses to {msg_id}")
 
     def send_to_rank(
         self, rank: int, msg_type: str, data: Any, timeout: Optional[float] = None
@@ -273,12 +283,13 @@ class CommunicationManager:
             data (Any): Data payload for the message
             timeout (Optional[float]): Maximum time to wait for response.
                 If None, uses the default_timeout set during initialization.
+                If default_timeout is also None, waits indefinitely.
             
         Returns:
             Any: Response data from the worker
             
         Raises:
-            TimeoutError: If worker doesn't respond within timeout
+            TimeoutError: If worker doesn't respond within timeout (only when timeout is set)
             
         Example:
             >>> response = manager.send_to_rank(0, "execute", "print('hello')")
@@ -306,12 +317,13 @@ class CommunicationManager:
             data (Any): Data payload for the message
             timeout (Optional[float]): Maximum time to wait for responses.
                 If None, uses the default_timeout set during initialization.
+                If default_timeout is also None, waits indefinitely.
             
         Returns:
             Dict[int, Any]: Responses from workers, keyed by rank
             
         Raises:
-            TimeoutError: If any worker doesn't respond within timeout
+            TimeoutError: If any worker doesn't respond within timeout (only when timeout is set)
             
         Example:
             >>> responses = manager.send_to_ranks([0,2], "execute", "print(rank)")
@@ -333,18 +345,29 @@ class CommunicationManager:
             self.coordinator_socket.send_multipart([worker_id, serialized])
 
         # Modified wait condition for subset of ranks
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if msg_id in self.message_queue and len(self.message_queue[msg_id]) == len(
-                ranks
-            ):
-                responses = self.message_queue[msg_id]
-                del self.message_queue[msg_id]
-                del self.response_events[msg_id]
-                return {rank: msg.data for rank, msg in responses.items()}
-            time.sleep(0.01)
-
-        raise TimeoutError(f"Timeout waiting for responses from ranks {ranks}")
+        if timeout is not None:
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                if msg_id in self.message_queue and len(self.message_queue[msg_id]) == len(
+                    ranks
+                ):
+                    responses = self.message_queue[msg_id]
+                    del self.message_queue[msg_id]
+                    del self.response_events[msg_id]
+                    return {rank: msg.data for rank, msg in responses.items()}
+                time.sleep(0.01)
+            raise TimeoutError(f"Timeout waiting for responses from ranks {ranks}")
+        else:
+            # Wait indefinitely when no timeout is set
+            while True:
+                if msg_id in self.message_queue and len(self.message_queue[msg_id]) == len(
+                    ranks
+                ):
+                    responses = self.message_queue[msg_id]
+                    del self.message_queue[msg_id]
+                    del self.response_events[msg_id]
+                    return {rank: msg.data for rank, msg in responses.items()}
+                time.sleep(0.01)
 
     def shutdown(self):
         """
